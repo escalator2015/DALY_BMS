@@ -30,8 +30,8 @@ static const char *TAG     = "DALY_BLE";
 static const char *TAG_WIFI = "WIFI";
 
 /* ---- credenciales WiFi ---- */
-#define WIFI_SSID        "LuaNet"
-#define WIFI_PASS        "Escondido2015"
+#define WIFI_SSID        "ENIGMA_B"
+#define WIFI_PASS        "nONhAYcOLLONS1960"
 #define WIFI_RETRY_MAX   10
 
 /* bits del EventGroup WiFi */
@@ -41,7 +41,7 @@ static const char *TAG_WIFI = "WIFI";
 static EventGroupHandle_t s_wifi_event_group = nullptr;
 static int                s_wifi_retry_count  = 0;
 
-#define BMS_MAC_ADDRESS   "50:18:06:01:15:2a"
+#define BMS_MAC_ADDRESS   "50:18:12:01:1b:68"  /* dirección MAC del BMS (en minúsculas) */
 #define SERVICE_UUID_MAIN "0000fff0-0000-1000-8000-00805f9b34fb"
 #define CHAR_UUID_TX      "0000fff1-0000-1000-8000-00805f9b34fb"  /* NOTIFY BMS→Host */
 #define CHAR_UUID_RX      "0000fff2-0000-1000-8000-00805f9b34fb"  /* WRITE  Host→BMS */
@@ -394,7 +394,7 @@ static void scanForBMS(int durationSeconds)
     scan->setInterval(80);
     scan->setWindow(60);
     scan->setMaxResults(0);
-    scan->start(durationSeconds, false);
+    scan->start((uint32_t)durationSeconds * 1000, false);
 
     uint64_t start = millis();
     while (millis() - start < (uint64_t)durationSeconds * 1000 + 1000) {
@@ -450,7 +450,7 @@ static bool connectToBMS(void)
     if (pClient) { NimBLEDevice::deleteClient(pClient); pClient = nullptr; }
     pClient = NimBLEDevice::createClient();
     pClient->setClientCallbacks(new ClientCallbacks());
-    pClient->setConnectTimeout(5);
+    pClient->setConnectTimeout(5000);
     if (!pClient->connect(bmsInfo.address)) {
         NimBLEDevice::deleteClient(pClient);
         pClient = nullptr;
@@ -618,6 +618,14 @@ static esp_err_t root_handler(httpd_req_t *req)
     return ESP_OK;
 }
 //-------------------------------------------------------------------
+/* ---- GET /favicon.ico → 204 No Content ---- */
+static esp_err_t favicon_handler(httpd_req_t *req)
+{
+    httpd_resp_set_status(req, "204 No Content");
+    httpd_resp_send(req, nullptr, 0);
+    return ESP_OK;
+}
+//-------------------------------------------------------------------
 /* ---- WebSocket /ws ---- */
 static esp_err_t ws_handler(httpd_req_t *req)
 {
@@ -691,6 +699,17 @@ static void http_server_init(void)
         .supported_subprotocol  = nullptr,
     };
     httpd_register_uri_handler(s_httpd, &ws_uri);
+
+    static const httpd_uri_t favicon_uri = {
+        .uri                    = "/favicon.ico",
+        .method                 = HTTP_GET,
+        .handler                = favicon_handler,
+        .user_ctx               = nullptr,
+        .is_websocket           = false,
+        .handle_ws_control_frames = false,
+        .supported_subprotocol  = nullptr,
+    };
+    httpd_register_uri_handler(s_httpd, &favicon_uri);
 
     ESP_LOGI(TAG, "HTTP server en http://%s/",
              s_bms.wifi_ip[0] ? s_bms.wifi_ip : "<ip pendiente>");
@@ -847,6 +866,9 @@ extern "C" void app_main(void)
     /* Mutex para BmsState — crear antes de arrancar cualquier tarea */
     s_bms_mutex = xSemaphoreCreateMutex();
     configASSERT(s_bms_mutex);
+
+    /* Reducir verbosidad de NimBLE (oculta cada write/procedure GATT) */
+    esp_log_level_set("NimBLE", ESP_LOG_WARN);
 
     /* WiFi primero: inicializa netif y el event loop compartido con NimBLE */
     wifi_init_sta();
