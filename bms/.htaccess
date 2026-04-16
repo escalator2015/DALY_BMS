@@ -1,0 +1,10 @@
+# Proteger el fichero de datos de acceso directo externo
+<Files "bms_data.json">
+    Order allow,deny
+    Deny from all
+</Files>
+
+<Files "bms_data.json.tmp">
+    Order allow,deny
+    Deny from all
+</Files>

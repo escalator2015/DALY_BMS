@@ -23,6 +23,9 @@
 #include "nvs_flash.h"
 #include "NimBLEDevice.h"
 #include "esp_http_server.h"
+#include "esp_http_client.h"
+#include "esp_crt_bundle.h"
+#include "mdns.h"
 #include "esp_heap_caps.h"
 #include "cJSON.h"
 
@@ -45,6 +48,11 @@ static int                s_wifi_retry_count  = 0;
 #define SERVICE_UUID_MAIN "0000fff0-0000-1000-8000-00805f9b34fb"
 #define CHAR_UUID_TX      "0000fff1-0000-1000-8000-00805f9b34fb"  /* NOTIFY BMS→Host */
 #define CHAR_UUID_RX      "0000fff2-0000-1000-8000-00805f9b34fb"  /* WRITE  Host→BMS */
+
+/* ---- Push remoto a Hostalia ---- */
+#define REMOTE_PUSH_URL   "https://luaresearch.es/bms/update.php"  /* cambiar por tu dominio */
+#define REMOTE_API_KEY    "c864645245ca1dcd5d6a0d6ca3754512c26a7a07ff722c853d1587b18bf1916f"              /* igual que en update.php */
+#define REMOTE_PUSH_MS    5000                                     /* intervalo push en ms */
 //-------------------------------------------------------------------
 /* ---- sustitutos de millis() / delay() de Arduino ---- */
 static inline uint64_t millis(void)
@@ -852,6 +860,52 @@ static void daly_ble_task(void *pvParameters)
     }
 }
 //-------------------------------------------------------------------
+/* ------------------------------------------------------------------ */
+/* ---- Tarea push remoto a Hostalia                              ---- */
+/* ------------------------------------------------------------------ */
+static void remote_push_task(void *pvParameters)
+{
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(REMOTE_PUSH_MS));
+
+        /* Esperar a tener WiFi (ip conocida) */
+        if (s_bms_mutex) {
+            xSemaphoreTake(s_bms_mutex, portMAX_DELAY);
+            bool has_ip = (s_bms.wifi_ip[0] != '\0');
+            xSemaphoreGive(s_bms_mutex);
+            if (!has_ip) continue;
+        }
+
+        char *json = build_status_json();
+        if (!json) continue;
+
+        esp_http_client_config_t cfg = {};
+        cfg.url               = REMOTE_PUSH_URL;
+        cfg.method            = HTTP_METHOD_POST;
+        cfg.crt_bundle_attach = esp_crt_bundle_attach;  /* verifica certificado SSL */
+        cfg.timeout_ms        = 8000;
+
+        esp_http_client_handle_t client = esp_http_client_init(&cfg);
+        esp_http_client_set_header(client, "Content-Type", "application/json");
+        esp_http_client_set_header(client, "X-API-Key",    REMOTE_API_KEY);
+        esp_http_client_set_post_field(client, json, (int)strlen(json));
+
+        esp_err_t err = esp_http_client_perform(client);
+        if (err == ESP_OK) {
+            int status = esp_http_client_get_status_code(client);
+            if (status == 200) {
+                ESP_LOGI(TAG, "Push remoto OK (HTTP 200)");
+            } else {
+                ESP_LOGW(TAG, "Push remoto: HTTP %d", status);
+            }
+        } else {
+            ESP_LOGW(TAG, "Push remoto falló: %s", esp_err_to_name(err));
+        }
+        esp_http_client_cleanup(client);
+        free(json);
+    }
+}
+//-------------------------------------------------------------------
 /* ---- punto de entrada ESP-IDF ---- */
 extern "C" void app_main(void)
 {
@@ -876,7 +930,15 @@ extern "C" void app_main(void)
     /* HTTP server + WebSocket (requiere IP activa) */
     http_server_init();
 
-    xTaskCreate(daly_ble_task, "daly_ble", 12288, nullptr, 5, nullptr);
+    /* mDNS: accesible como http://bms.local en la red local */
+    mdns_init();
+    mdns_hostname_set("bms");
+    mdns_instance_name_set("Daly BMS");
+    mdns_service_add(nullptr, "_http", "_tcp", 80, nullptr, 0);
+    ESP_LOGI(TAG, "mDNS iniciado: http://bms.local/");
+
+    xTaskCreate(daly_ble_task,    "daly_ble",    12288, nullptr, 5, nullptr);
+    xTaskCreate(remote_push_task, "remote_push",  8192, nullptr, 3, nullptr);
     while(1) {
         vTaskDelay(pdMS_TO_TICKS(1000));
     }

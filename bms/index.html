@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Daly BMS</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#111;color:#ccc;font:13px/1.5 'JetBrains Mono','Fira Code',Consolas,monospace}
+.wrap{max-width:1000px;margin:0 auto;padding:8px 12px}
+header{display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid #333;margin-bottom:12px}
+header h1{font-size:16px;color:#e8a030;font-weight:600}
+header .meta{font-size:11px;color:#888;text-align:right;line-height:1.8}
+.card{background:#1a1a1a;border:1px solid #282828;border-radius:4px;padding:10px 14px;margin-bottom:10px}
+.card h2{font-size:12px;color:#e8a030;text-transform:uppercase;letter-spacing:1px;margin-bottom:8px}
+.row{display:flex;flex-wrap:wrap;gap:6px 18px}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:5px;vertical-align:middle}
+.dg{background:#4a4}.da{background:#e8a030}.dr{background:#c44}.dn{background:#444}
+.lbl{color:#999;font-size:11px}.val{color:#eee}
+.big{font-size:28px;color:#e8a030;font-weight:600;line-height:1}
+.soc-wrap{margin:8px 0 2px}
+.soc-track{background:#222;border:1px solid #2a2a2a;border-radius:3px;height:18px;overflow:hidden}
+.soc-fill{height:100%;background:#4a4;border-radius:2px;transition:width .6s,background .6s}
+.cell-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(72px,1fr));gap:4px;margin-top:6px}
+.cell-item{background:#222;border:1px solid #2a2a2a;border-radius:3px;padding:4px 6px}
+.cell-item .cn{color:#888;font-size:10px}
+.cell-item .cv{color:#eee;font-weight:600;font-size:12px}
+.cell-bar{height:4px;border-radius:2px;margin-top:3px;background:#444;transition:width .3s,background .3s}
+.bal-grid{display:flex;flex-wrap:wrap;gap:4px;margin-top:6px}
+.bal-item{display:flex;align-items:center;font-size:11px;background:#222;padding:2px 7px;border-radius:3px}
+.mos{display:inline-block;padding:1px 7px;border-radius:2px;font-size:11px;font-weight:600}
+.mos-on{background:#0d2a0d;color:#4a4;border:1px solid #1a4a1a}
+.mos-off{background:#2a0d0d;color:#c44;border:1px solid #4a1a1a}
+footer{border-top:1px solid #333;padding:8px 0;font-size:11px;color:#888;display:flex;justify-content:space-between;flex-wrap:wrap;gap:4px;margin-top:4px}
+.stale-banner{background:#2a1a00;border:1px solid #e8a030;border-radius:4px;padding:6px 12px;margin-bottom:10px;font-size:12px;color:#e8a030;display:none}
+.stale-banner.show{display:block}
+@media(max-width:700px){.grid{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>&#9889; Daly BMS</h1>
+  <div class="meta">
+    <span><span class="dot dr" id="ble-dot"></span><span id="ble-lbl">BLE: desconectado</span></span><br>
+    <span id="wifi-ip">WiFi: --</span>
+  </div>
+</header>
+
+<div class="stale-banner" id="stale-banner">
+  &#9888; Sin datos recientes del ESP32 — última actualización hace <span id="stale-age">?</span> s
+</div>
+
+<!-- Estado General -->
+<div class="card">
+  <h2>Estado General</h2>
+  <div class="row" style="margin-bottom:10px">
+    <span><span class="lbl">Voltaje </span><span class="val" id="voltage">--</span><span class="lbl"> V</span></span>
+    <span><span class="lbl">Corriente </span><span class="val" id="current">--</span><span class="lbl"> A</span></span>
+    <span><span class="lbl">Potencia </span><span class="val" id="power">--</span><span class="lbl"> W</span></span>
+    <span><span class="lbl">Restante </span><span class="val" id="rem-mah">--</span><span class="lbl"> mAh</span></span>
+  </div>
+  <div class="soc-wrap">
+    <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:4px">
+      <span class="lbl">Estado de Carga (SOC)</span>
+      <span class="big" id="soc">-- %</span>
+    </div>
+    <div class="soc-track"><div class="soc-fill" id="soc-fill" style="width:0%"></div></div>
+  </div>
+</div>
+
+<div class="grid">
+  <!-- Celdas min/max -->
+  <div class="card">
+    <h2>Celdas Min / Max</h2>
+    <div class="row">
+      <span><span class="lbl">M&#225;x </span><span class="val" id="max-v">--</span><span class="lbl"> V (&num;</span><span id="max-n">-</span><span class="lbl">)</span></span>
+      <span><span class="lbl">M&#237;n </span><span class="val" id="min-v">--</span><span class="lbl"> V (&num;</span><span id="min-n">-</span><span class="lbl">)</span></span>
+    </div>
+    <div style="margin-top:6px">
+      <span class="lbl">Diferencia </span><span class="val" id="diff-mv">--</span><span class="lbl"> mV</span>
+    </div>
+  </div>
+  <!-- Temperatura -->
+  <div class="card">
+    <h2>Temperatura</h2>
+    <div class="row">
+      <span><span class="lbl">M&#225;x </span><span class="val" id="temp-max">--</span><span class="lbl"> &#176;C (S</span><span id="temp-max-s">-</span><span class="lbl">)</span></span>
+      <span><span class="lbl">M&#237;n </span><span class="val" id="temp-min">--</span><span class="lbl"> &#176;C (S</span><span id="temp-min-s">-</span><span class="lbl">)</span></span>
+    </div>
+  </div>
+</div>
+
+<div class="grid">
+  <!-- Estado BMS -->
+  <div class="card">
+    <h2>Estado BMS</h2>
+    <div class="row" style="margin-bottom:8px">
+      <span><span class="lbl">Modo </span><span class="val" id="bms-mode">--</span></span>
+    </div>
+    <span class="lbl">Carga&nbsp;</span><span id="c-mos" class="mos mos-off">OFF</span>
+    <span class="lbl" style="margin-left:10px">Descarga&nbsp;</span><span id="d-mos" class="mos mos-off">OFF</span>
+  </div>
+  <!-- Configuración -->
+  <div class="card">
+    <h2>Configuraci&#243;n Pack</h2>
+    <div class="row">
+      <span><span class="lbl">Celdas </span><span class="val" id="cfg-cells">--</span></span>
+      <span><span class="lbl">T.Sens </span><span class="val" id="cfg-temps">--</span></span>
+      <span><span class="lbl">Ciclos </span><span class="val" id="cfg-cycles">--</span></span>
+      <span><span class="lbl">Cargador </span><span class="val" id="cfg-charger">--</span></span>
+      <span><span class="lbl">Carga </span><span class="val" id="cfg-load">--</span></span>
+    </div>
+  </div>
+</div>
+
+<!-- Voltajes por celda -->
+<div class="card">
+  <h2>Voltajes por Celda</h2>
+  <div class="cell-grid" id="cell-grid"><span class="lbl">Sin datos</span></div>
+</div>
+
+<!-- Balanceo -->
+<div class="card">
+  <h2>Estado de Balanceo</h2>
+  <div class="bal-grid" id="bal-grid"><span class="lbl">Sin datos</span></div>
+</div>
+
+<footer>
+  <span>Uptime ESP32: <span id="uptime">--</span></span>
+  <span>Heap: <span id="heap">--</span></span>
+  <span>Actualizado: <span id="last-update">--</span></span>
+  <span>Designed by J.M.Tasende &copy;2026</span>
+</footer>
+
+</div><!-- .wrap -->
+<script>
+(function(){
+  var POLL_MS = 3000;
+
+  function g(id){ return document.getElementById(id); }
+  function fmt1(n){ return n != null ? Number(n).toFixed(1) : "--"; }
+  function fmt3(n){ return n != null ? Number(n).toFixed(3) : "--"; }
+  function fmtI(n){ return n != null ? Number(n).toLocaleString() : "--"; }
+  function fmtUp(s){
+    if(s == null) return "--";
+    var d=Math.floor(s/86400), h=Math.floor(s%86400/3600),
+        m=Math.floor(s%3600/60), r=s%60, p=[];
+    if(d) p.push(d+"d"); p.push(h+"h"); p.push(m+"m"); p.push(r+"s");
+    return p.join(" ");
+  }
+  function cellColor(v){
+    if(v <= 0)   return "#444";
+    if(v >= 3.5) return "#4a4";
+    if(v >= 3.2) return "#e8a030";
+    return "#c44";
+  }
+  function pct(v, lo, hi){ return Math.max(0, Math.min(100, (v-lo)/(hi-lo)*100)); }
+
+  function render(d){
+    if(!d || d.error) return;
+
+    /* Banner de datos obsoletos */
+    var banner = g("stale-banner");
+    if(d.stale){
+      g("stale-age").textContent = d.age_s || "?";
+      banner.classList.add("show");
+    } else {
+      banner.classList.remove("show");
+    }
+
+    /* BLE */
+    var ble = d.ble || {};
+    g("ble-dot").className = "dot " + (ble.connected ? "dg" : "dr");
+    g("ble-lbl").textContent = "BLE: " + (ble.connected ? "conectado" : "desconectado");
+
+    /* WiFi */
+    if(d.wifi) g("wifi-ip").textContent = "IP: " + (d.wifi.ip || "--");
+
+    /* Basic (0x90) */
+    if(d.basic){
+      g("voltage").textContent = fmt1(d.basic.v);
+      g("current").textContent = fmt1(d.basic.i);
+      g("power").textContent   = fmt1(d.basic.v * d.basic.i);
+      var soc = d.basic.soc || 0;
+      g("soc").textContent = soc.toFixed(1) + " %";
+      var fill = g("soc-fill");
+      fill.style.width      = soc + "%";
+      fill.style.background = soc > 50 ? "#4a4" : soc > 20 ? "#e8a030" : "#c44";
+    }
+
+    if(d.state) g("rem-mah").textContent = fmtI(d.state.rem_mah);
+
+    /* Min/Max (0x91) */
+    if(d.minmax){
+      g("max-v").textContent   = fmt3(d.minmax.max_v);
+      g("max-n").textContent   = d.minmax.max_n || "-";
+      g("min-v").textContent   = fmt3(d.minmax.min_v);
+      g("min-n").textContent   = d.minmax.min_n || "-";
+      g("diff-mv").textContent = d.minmax.diff_mv != null ? d.minmax.diff_mv : "--";
+    }
+
+    /* Temperature (0x92) */
+    if(d.temp){
+      g("temp-max").textContent   = fmt1(d.temp.max);
+      g("temp-max-s").textContent = d.temp.max_s || "-";
+      g("temp-min").textContent   = fmt1(d.temp.min);
+      g("temp-min-s").textContent = d.temp.min_s || "-";
+    }
+
+    /* State (0x93) */
+    if(d.state){
+      var modes = ["Estacionario", "Cargando", "Descargando"];
+      g("bms-mode").textContent = modes[d.state.mode] || "Desconocido";
+      var cm = g("c-mos"), dm = g("d-mos");
+      cm.textContent = d.state.c_mos ? "ON" : "OFF";
+      cm.className   = "mos " + (d.state.c_mos ? "mos-on" : "mos-off");
+      dm.textContent = d.state.d_mos ? "ON" : "OFF";
+      dm.className   = "mos " + (d.state.d_mos ? "mos-on" : "mos-off");
+    }
+
+    /* Config (0x94) */
+    if(d.cfg){
+      g("cfg-cells").textContent   = d.cfg.cells   || "--";
+      g("cfg-temps").textContent   = d.cfg.temps   || "--";
+      g("cfg-cycles").textContent  = d.cfg.cycles  || "--";
+      g("cfg-charger").textContent = d.cfg.charger ? "S\u00ed" : "No";
+      g("cfg-load").textContent    = d.cfg.load    ? "S\u00ed" : "No";
+    }
+
+    /* Cell voltages (0x95) */
+    if(d.voltages && d.voltages.length){
+      var cg = g("cell-grid"), h = "";
+      for(var i = 0; i < d.voltages.length; i++){
+        var v = d.voltages[i], col = cellColor(v), p2 = pct(v, 2.8, 4.3);
+        h += '<div class="cell-item">'
+           + '<div class="cn">C' + (i+1) + '</div>'
+           + '<div class="cv">' + v.toFixed(3) + ' V</div>'
+           + '<div class="cell-bar" style="width:' + p2.toFixed(0) + '%;background:' + col + '"></div>'
+           + '</div>';
+      }
+      cg.innerHTML = h;
+    }
+
+    /* Balance (0x97) */
+    if(d.balance && d.balance.length){
+      var bg = g("bal-grid"), h2 = "";
+      for(var j = 0; j < d.balance.length; j++){
+        var bal = d.balance[j];
+        h2 += '<div class="bal-item">'
+            + '<span class="dot ' + (bal ? "da" : "dn") + '"></span>C' + (j+1)
+            + '</div>';
+      }
+      bg.innerHTML = h2;
+    }
+
+    /* Footer */
+    g("uptime").textContent     = fmtUp(d.uptime);
+    g("heap").textContent       = d.heap != null ? fmtI(d.heap) + " B" : "--";
+    g("last-update").textContent = new Date().toLocaleTimeString();
+  }
+
+  function poll(){
+    fetch("data.php?_=" + Date.now())
+      .then(function(r){ return r.json(); })
+      .then(render)
+      .catch(function(){ /* silencioso en error de red */ });
+  }
+
+  poll();
+  setInterval(poll, POLL_MS);
+})();
+</script>
+</body>
+</html>

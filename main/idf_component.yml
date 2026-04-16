@@ -3,3 +3,5 @@ dependencies:
   idf: ">=5.0.0"
   h2zero/esp-nimble-cpp:
     version: ">=2.5.0"
+  espressif/mdns:
+    version: ">=1.0.0"
