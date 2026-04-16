@@ -1,0 +1,53 @@
+# Configuración mínima para Daly BMS BLE Client + WiFi STA — ESP32-S3
+# Aplica cuando se regenera el sdkconfig (idf.py reconfigure)
+
+# ---- Target ----
+CONFIG_IDF_TARGET="esp32s3"
+
+# ---- PSRAM 4 MB (Octal PSRAM en ESP32-S3) ----
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_SIZE=4194304
+CONFIG_SPIRAM_USE_CAPS_ALLOC=y
+# Mover texto de tareas al IRAM por defecto para rendimiento
+CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=n
+
+# ---- Flash ----
+# La mayoría de módulos ESP32-S3 tienen flash Quad/Octal; ajusta si es diferente
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+
+# Habilitar Bluetooth
+CONFIG_BT_ENABLED=y
+CONFIG_BT_CONTROLLER_ENABLED=y
+
+# Usar NimBLE como host BLE (en lugar de Bluedroid)
+CONFIG_BT_NIMBLE_ENABLED=y
+
+# Roles necesarios: Central (para conectarse a dispositivos) y Observer (escaneo)
+CONFIG_BT_NIMBLE_ROLE_CENTRAL=y
+CONFIG_BT_NIMBLE_ROLE_OBSERVER=y
+
+# Una conexión simultánea es suficiente
+CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
+
+# BLE 5.0 (opcional, mejora rendimiento)
+CONFIG_BT_NIMBLE_50=y
+
+# Tabla de particiones personalizada (app factory 3 MB)
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_PARTITION_TABLE_OFFSET=0x8000
+
+# Habilitar WiFi
+CONFIG_ESP_WIFI_ENABLED=y
+
+# Coexistencia software WiFi + BT
+CONFIG_ESP_COEX_SW_COEXIST_ENABLE=y
+
+# HTTP server con soporte WebSocket
+CONFIG_HTTPD_WS_SUPPORT=y
+# Buffer de recepción del servidor HTTP (suficiente para la trama WS de comando)
+CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024
+CONFIG_HTTPD_MAX_URI_LEN=512
