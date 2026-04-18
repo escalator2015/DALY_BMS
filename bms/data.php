@@ -10,7 +10,6 @@ define('STALE_SEC', 30);   // considerar datos obsoletos si son > 30 s
 
 header('Content-Type: application/json; charset=utf-8');
 header('Cache-Control: no-store');
-header('Access-Control-Allow-Origin: *');  // permite fetch desde cualquier dominio
 
 if (!file_exists(DATA_FILE)) {
     echo '{"error":"no_data"}';

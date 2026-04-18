@@ -1,10 +1,22 @@
-# Proteger el fichero de datos de acceso directo externo
+# BMS Monitor — Protección HTTP Basic Auth
+# Ajusta AuthUserFile con la ruta absoluta de tu servidor Hostalia
+# (debe estar fuera del web root, ej: /home/luaresearch/.htpasswd_bms)
+
+AuthType Basic
+AuthName "BMS Monitor"
+AuthUserFile /var/www/vhosts/40196752.servicio-online.net/.htpasswd_bms
+Require valid-user
+
+# update.php se autentica por API key — no necesita contraseña HTTP
+<Files "update.php">
+    Require all granted
+</Files>
+
+# Estos ficheros nunca deben servirse directamente
 <Files "bms_data.json">
-    Order allow,deny
-    Deny from all
+    Require all denied
 </Files>
 
 <Files "bms_data.json.tmp">
-    Order allow,deny
-    Deny from all
+    Require all denied
 </Files>
