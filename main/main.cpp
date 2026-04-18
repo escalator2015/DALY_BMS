@@ -28,14 +28,25 @@
 #include "mdns.h"
 #include "esp_heap_caps.h"
 #include "cJSON.h"
+#include "nvs.h"
+#include "esp_system.h"
+#include "lwip/sockets.h"
 
 static const char *TAG     = "DALY_BLE";
 static const char *TAG_WIFI = "WIFI";
 
-/* ---- credenciales WiFi ---- */
-#define WIFI_SSID        "ENIGMA_B"
-#define WIFI_PASS        "nONhAYcOLLONS1960"
+/* ---- WiFi STA ---- */
 #define WIFI_RETRY_MAX   10
+
+/* ---- AP provisioning ---- */
+#define AP_SSID          "DALY-BMS-Setup"
+#define AP_CHANNEL       1
+#define AP_MAX_CONN      4
+
+/* ---- NVS keys para credenciales WiFi ---- */
+#define NVS_WIFI_NS      "wifi_cfg"
+#define NVS_WIFI_SSID    "ssid"
+#define NVS_WIFI_PASS    "pass"
 
 /* bits del EventGroup WiFi */
 #define WIFI_CONNECTED_BIT BIT0
@@ -120,9 +131,11 @@ struct BmsState {
     float    cell_v[48];     /* V    0x95 */
     uint16_t cell_mv[48];
     bool     balance[48];    /* 0x97 */
+    float    cell_temps[16]; /* °C   0x96 — temperaturas individuales por sensor */
+    uint32_t alarm_flags;    /* bitmask 0x98 — flags de alarma activos */
     bool     ble_connected;
     char     wifi_ip[16];
-    uint8_t  valid;          /* bitmask: bit0=0x90 … bit6=0x97 */
+    uint16_t valid;          /* bitmask: bit0=0x90 … bit7=0x96, bit8=0x98 */
 };
 static BmsState          s_bms       = {};
 static SemaphoreHandle_t s_bms_mutex = nullptr;
@@ -296,6 +309,43 @@ static void parseFrame(const uint8_t *frame)
             s_bms.valid |= (1u << 6);
             xSemaphoreGive(s_bms_mutex);
             ESP_LOGD(TAG, "0x97 balance actualizado");
+            break;
+        }
+        case 0x96: {
+            /* Temperaturas individuales: 7 sensores por trama, frame_number 1-based */
+            uint8_t frameNo = payload[0];
+            if (frameNo == 0) break;
+            int base = ((int)frameNo - 1) * 7;
+            xSemaphoreTake(s_bms_mutex, portMAX_DELAY);
+            int tCount = (s_bms.temp_count > 0) ? (int)s_bms.temp_count : 8;
+            if (tCount > 16) tCount = 16;
+            for (int i = 0; i < 7; ++i) {
+                int idx = base + i;
+                if (idx >= tCount || idx >= 16) break;
+                uint8_t raw = payload[1 + i];
+                s_bms.cell_temps[idx] = (raw >= 1) ? (raw - 40.0f) : 0.0f;
+            }
+            s_bms.valid |= (1u << 7);
+            xSemaphoreGive(s_bms_mutex);
+            ESP_LOGD(TAG, "0x96 frame=%d temps individuales", frameNo);
+            break;
+        }
+        case 0x98: {
+            /* Flags de alarma: payload[0]=byte alto, payload[1]=byte bajo alarmas */
+            /* byte0 bit7=cell_overvolt, 6=cell_undervolt, 5=pack_overvolt,        */
+            /* 4=pack_undervolt, 3=chg_overtemp, 2=chg_undertemp,                  */
+            /* 1=dis_overtemp, 0=dis_undertemp                                     */
+            /* byte1 bit7=chg_overcurrent, 6=dis_overcurrent, 5=short_circuit,     */
+            /* 4=ic_error, 3=mos_lock                                              */
+            uint32_t flags = (uint32_t)payload[0]
+                           | ((uint32_t)payload[1] << 8)
+                           | ((uint32_t)payload[2] << 16)
+                           | ((uint32_t)payload[3] << 24);
+            xSemaphoreTake(s_bms_mutex, portMAX_DELAY);
+            s_bms.alarm_flags = flags;
+            s_bms.valid |= (1u << 8);
+            xSemaphoreGive(s_bms_mutex);
+            ESP_LOGD(TAG, "0x98 alarm_flags=0x%08lX", (unsigned long)flags);
             break;
         }
         default:
@@ -554,6 +604,29 @@ static char *build_status_json(void)
         for (int i = 0; i < snap.cell_count; i++)
             cJSON_AddItemToArray(bal, cJSON_CreateBool(snap.balance[i]));
     }
+    if ((snap.valid & (1u << 7)) && snap.temp_count > 0) {
+        cJSON *ct = cJSON_AddArrayToObject(root, "cell_temps");
+        int tCount = snap.temp_count < 16 ? snap.temp_count : 16;
+        for (int i = 0; i < tCount; i++)
+            cJSON_AddItemToArray(ct, cJSON_CreateNumber((double)snap.cell_temps[i]));
+    }
+    if (snap.valid & (1u << 8)) {
+        cJSON *al = cJSON_AddObjectToObject(root, "alarms");
+        cJSON_AddNumberToObject(al, "flags",           (double)snap.alarm_flags);
+        cJSON_AddBoolToObject(al, "cell_overvolt",   (snap.alarm_flags >> 7) & 1);
+        cJSON_AddBoolToObject(al, "cell_undervolt",  (snap.alarm_flags >> 6) & 1);
+        cJSON_AddBoolToObject(al, "pack_overvolt",   (snap.alarm_flags >> 5) & 1);
+        cJSON_AddBoolToObject(al, "pack_undervolt",  (snap.alarm_flags >> 4) & 1);
+        cJSON_AddBoolToObject(al, "chg_overtemp",    (snap.alarm_flags >> 3) & 1);
+        cJSON_AddBoolToObject(al, "chg_undertemp",   (snap.alarm_flags >> 2) & 1);
+        cJSON_AddBoolToObject(al, "dis_overtemp",    (snap.alarm_flags >> 1) & 1);
+        cJSON_AddBoolToObject(al, "dis_undertemp",   (snap.alarm_flags >> 0) & 1);
+        cJSON_AddBoolToObject(al, "chg_overcurrent", (snap.alarm_flags >> 15) & 1);
+        cJSON_AddBoolToObject(al, "dis_overcurrent", (snap.alarm_flags >> 14) & 1);
+        cJSON_AddBoolToObject(al, "short_circuit",   (snap.alarm_flags >> 13) & 1);
+        cJSON_AddBoolToObject(al, "ic_error",        (snap.alarm_flags >> 12) & 1);
+        cJSON_AddBoolToObject(al, "mos_lock",        (snap.alarm_flags >> 11) & 1);
+    }
     cJSON_AddNumberToObject(root, "uptime",
                             (double)(esp_timer_get_time() / 1000000ULL));
     cJSON_AddNumberToObject(root, "heap",
@@ -667,6 +740,28 @@ static esp_err_t ws_handler(httpd_req_t *req)
             cJSON *code = cJSON_GetObjectItem(json, "code");
             if (code && cJSON_IsNumber(code))
                 sendDalyRequest((uint8_t)code->valueint);
+        } else if (strcmp(cs, "set_charge_mos") == 0) {
+            /* { "cmd": "set_charge_mos", "enable": true|false } */
+            cJSON *en = cJSON_GetObjectItem(json, "enable");
+            if (en && cJSON_IsBool(en)) {
+                uint8_t payload[8] = {};
+                payload[0] = cJSON_IsTrue(en) ? 0x01 : 0x00;
+                sendDalyRequest(0x44, payload);
+                ESP_LOGI(TAG, "WS → set_charge_mos %s", cJSON_IsTrue(en) ? "ON" : "OFF");
+            }
+        } else if (strcmp(cs, "set_discharge_mos") == 0) {
+            /* { "cmd": "set_discharge_mos", "enable": true|false } */
+            cJSON *en = cJSON_GetObjectItem(json, "enable");
+            if (en && cJSON_IsBool(en)) {
+                uint8_t payload[8] = {};
+                payload[0] = cJSON_IsTrue(en) ? 0x01 : 0x00;
+                sendDalyRequest(0x45, payload);
+                ESP_LOGI(TAG, "WS → set_discharge_mos %s", cJSON_IsTrue(en) ? "ON" : "OFF");
+            }
+        } else if (strcmp(cs, "reset_soc") == 0) {
+            /* { "cmd": "reset_soc" }  — resetea el SOC al 100% */
+            sendDalyRequest(0x00);
+            ESP_LOGI(TAG, "WS → reset_soc enviado");
         }
     }
     cJSON_Delete(json);
@@ -725,9 +820,282 @@ static void http_server_init(void)
     xTaskCreate(ws_push_task, "ws_push", 4096, nullptr, 4, nullptr);
 }
 //-------------------------------------------------------------------
-/* ------------------------------------------------------------------ */
+/* ================================================================== */
+/* ---- WiFi: NVS credentials + captive portal provisioning      ---- */
+/* ================================================================== */
+
+/* ---- HTML del captive portal (embebido inline) ---- */
+static const char CP_HTML[] =
+"<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
+"<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+"<title>DALY BMS - WiFi Setup</title>"
+"<style>"
+"*{box-sizing:border-box}"
+"body{font-family:sans-serif;max-width:420px;margin:30px auto;padding:16px;background:#0d1b2a;color:#e0e0e0}"
+"h1{color:#00d4ff;text-align:center;margin-bottom:20px}"
+"label{display:block;margin:10px 0 3px;color:#aaa;font-size:.9em}"
+"input,select{width:100%;padding:9px;background:#1a2a3a;color:#eee;border:1px solid #2a4a6a;border-radius:5px;font-size:1em}"
+".btn{display:block;width:100%;padding:11px;margin-top:8px;border:none;border-radius:5px;cursor:pointer;font-size:1em;font-weight:bold}"
+".sec{background:#1a3a5a;color:#00d4ff}.pri{background:#00d4ff;color:#000;margin-top:14px}"
+"#st{text-align:center;margin-top:14px;min-height:18px;color:#aaa}"
+"</style></head><body>"
+"<h1>DALY BMS<br><small style=\"font-size:.5em;color:#888\">WiFi Setup</small></h1>"
+"<label>Red WiFi (SSID)</label>"
+"<input id=\"sid\" type=\"text\" placeholder=\"Nombre de la red\" required>"
+"<label>Contrase&#xF1;a</label>"
+"<input id=\"pwd\" type=\"password\" placeholder=\"Vac&#xED;o si es red abierta\">"
+"<button class=\"btn sec\" onclick=\"scan()\">&#128246; Escanear redes</button>"
+"<select id=\"nets\" style=\"display:none;margin-top:5px\""
+" onchange=\"if(this.value)document.getElementById('sid').value=this.value\">"
+"<option value=\"\">-- Seleccionar --</option></select>"
+"<button class=\"btn pri\" onclick=\"save()\">&#10003; Guardar y reiniciar</button>"
+"<div id=\"st\"></div>"
+"<script>"
+"function st(m,c){var e=document.getElementById('st');e.textContent=m;e.style.color=c||'#aaa';}"
+"function scan(){"
+"  st('Escaneando...');"
+"  fetch('/wifi/scan').then(function(r){return r.json();}).then(function(d){"
+"    var s=document.getElementById('nets');"
+"    s.innerHTML='<option value=\"\">-- Seleccionar --</option>';"
+"    d.forEach(function(n){var o=document.createElement('option');o.textContent=n;s.appendChild(o);});"
+"    s.style.display='block';st(d.length+' redes encontradas');"
+"  }).catch(function(){st('Error al escanear','#f66');});"
+"}"
+"function save(){"
+"  var s=document.getElementById('sid').value.trim();"
+"  if(!s){st('Introduce un SSID','#f66');return;}"
+"  st('Guardando...');"
+"  fetch('/wifi/save',{method:'POST',headers:{'Content-Type':'application/json'},"
+"    body:JSON.stringify({ssid:s,pass:document.getElementById('pwd').value})})"
+"  .then(function(r){return r.text();}).then(function(t){st(t,'#0d0');})"
+"  .catch(function(){st('Error guardando','#f66');});"
+"}"
+"</script></body></html>";
+
+/* ---- NVS: cargar credenciales WiFi ---- */
+static bool wifi_credentials_load(char *ssid, size_t ssid_len,
+                                   char *pass, size_t pass_len)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_WIFI_NS, NVS_READONLY, &h) != ESP_OK) return false;
+    bool ok = (nvs_get_str(h, NVS_WIFI_SSID, ssid, &ssid_len) == ESP_OK &&
+               nvs_get_str(h, NVS_WIFI_PASS, pass, &pass_len) == ESP_OK &&
+               ssid[0] != '\0');
+    nvs_close(h);
+    return ok;
+}
+
+/* ---- NVS: guardar credenciales WiFi ---- */
+static void wifi_credentials_save(const char *ssid, const char *pass)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_WIFI_NS, NVS_READWRITE, &h) != ESP_OK) return;
+    nvs_set_str(h, NVS_WIFI_SSID, ssid);
+    nvs_set_str(h, NVS_WIFI_PASS, pass ? pass : "");
+    nvs_commit(h);
+    nvs_close(h);
+    ESP_LOGI(TAG_WIFI, "Credenciales WiFi guardadas para SSID: '%s'", ssid);
+}
+
+/* ---- DNS server: responde todas las queries A con 192.168.4.1 ---- */
+static void dns_server_task(void *pvParameters)
+{
+    const uint8_t ap_ip[4] = {192, 168, 4, 1};
+
+    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (sock < 0) { vTaskDelete(NULL); return; }
+
+    int opt = 1;
+    setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    struct sockaddr_in addr = {};
+    addr.sin_family      = AF_INET;
+    addr.sin_port        = htons(53);
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+
+    if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        close(sock); vTaskDelete(NULL); return;
+    }
+    ESP_LOGI(TAG_WIFI, "DNS captive portal escuchando en :53");
+
+    uint8_t buf[512];
+    uint8_t resp[512 + 20];
+
+    for (;;) {
+        struct sockaddr_in client = {};
+        socklen_t clen = sizeof(client);
+        int len = recvfrom(sock, buf, sizeof(buf) - 1, 0,
+                           (struct sockaddr *)&client, &clen);
+        if (len < 12 || len > (int)(sizeof(resp) - 20)) continue;
+
+        memcpy(resp, buf, (size_t)len);
+        resp[2] = 0x81; /* QR=1, AA=1 */
+        resp[3] = 0x80; /* RA=1, RCODE=0 */
+        resp[6] = 0x00; resp[7] = 0x01;  /* answer count = 1 */
+        resp[8] = resp[9]   = 0x00;      /* authority = 0    */
+        resp[10] = resp[11] = 0x00;      /* additional = 0   */
+
+        int rlen = len;
+        /* Answer: ptr→pregunta, tipo A, clase IN, TTL 10s, 4 bytes IP */
+        resp[rlen++] = 0xC0; resp[rlen++] = 0x0C;
+        resp[rlen++] = 0x00; resp[rlen++] = 0x01; /* type A  */
+        resp[rlen++] = 0x00; resp[rlen++] = 0x01; /* class IN */
+        resp[rlen++] = 0x00; resp[rlen++] = 0x00;
+        resp[rlen++] = 0x00; resp[rlen++] = 0x0A; /* TTL = 10s */
+        resp[rlen++] = 0x00; resp[rlen++] = 0x04; /* rdlength = 4 */
+        resp[rlen++] = ap_ip[0]; resp[rlen++] = ap_ip[1];
+        resp[rlen++] = ap_ip[2]; resp[rlen++] = ap_ip[3];
+
+        sendto(sock, resp, (size_t)rlen, 0, (struct sockaddr *)&client, clen);
+    }
+}
+
+/* ---- HTTP: página principal del captive portal ---- */
+static esp_err_t wifi_setup_handler(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_send(req, CP_HTML, (ssize_t)strlen(CP_HTML));
+    return ESP_OK;
+}
+
+/* ---- HTTP: escaneo WiFi → JSON array de SSIDs ---- */
+static esp_err_t wifi_scan_handler(httpd_req_t *req)
+{
+    wifi_scan_config_t scfg = {};
+    scfg.show_hidden = false;
+    esp_wifi_scan_start(&scfg, true);   /* bloqueante */
+
+    uint16_t count = 20;
+    wifi_ap_record_t records[20];
+    memset(records, 0, sizeof(records));
+    esp_wifi_scan_get_ap_records(&count, records);
+
+    cJSON *arr = cJSON_CreateArray();
+    for (int i = 0; i < (int)count; i++) {
+        if (records[i].ssid[0] != '\0')
+            cJSON_AddItemToArray(arr, cJSON_CreateString((char *)records[i].ssid));
+    }
+    char *json = cJSON_PrintUnformatted(arr);
+    cJSON_Delete(arr);
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, json, (ssize_t)strlen(json));
+    free(json);
+    return ESP_OK;
+}
+
+/* ---- HTTP: guardar credenciales WiFi y reiniciar ---- */
+static esp_err_t wifi_save_handler(httpd_req_t *req)
+{
+    char buf[384] = {};
+    int received  = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (received <= 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Bad Request");
+        return ESP_FAIL;
+    }
+    buf[received] = '\0';
+
+    cJSON *json   = cJSON_Parse(buf);
+    cJSON *ssid_j = json ? cJSON_GetObjectItem(json, "ssid") : nullptr;
+    cJSON *pass_j = json ? cJSON_GetObjectItem(json, "pass") : nullptr;
+
+    if (!ssid_j || !cJSON_IsString(ssid_j) || ssid_j->valuestring[0] == '\0') {
+        if (json) cJSON_Delete(json);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "SSID requerido");
+        return ESP_FAIL;
+    }
+
+    const char *ssid = ssid_j->valuestring;
+    const char *pass = (pass_j && cJSON_IsString(pass_j)) ? pass_j->valuestring : "";
+    wifi_credentials_save(ssid, pass);
+    cJSON_Delete(json);
+
+    static const char ok_msg[] =
+        "Credenciales guardadas. Reiniciando en 2 segundos...";
+    httpd_resp_set_type(req, "text/plain; charset=utf-8");
+    httpd_resp_send(req, ok_msg, (ssize_t)sizeof(ok_msg) - 1);
+
+    vTaskDelay(pdMS_TO_TICKS(2000));
+    esp_restart();
+    return ESP_OK; /* no alcanzado */
+}
+
+/* ---- HTTP 404: redirige todo al portal (captive portal detection) ---- */
+static esp_err_t captive_404_handler(httpd_req_t *req, httpd_err_code_t err)
+{
+    httpd_resp_set_status(req, "302 Found");
+    httpd_resp_set_hdr(req, "Location", "http://192.168.4.1/");
+    httpd_resp_send(req, NULL, 0);
+    return ESP_OK;
+}
+
+/* ---- iniciar HTTP server del captive portal ---- */
+static void http_captive_server_init(void)
+{
+    httpd_config_t cfg   = HTTPD_DEFAULT_CONFIG();
+    cfg.lru_purge_enable = true;
+    cfg.max_open_sockets = AP_MAX_CONN + 2;
+
+    if (httpd_start(&s_httpd, &cfg) != ESP_OK) {
+        ESP_LOGE(TAG, "Error iniciando HTTP captive portal");
+        return;
+    }
+
+    static const httpd_uri_t uri_root = {
+        .uri = "/", .method = HTTP_GET,
+        .handler = wifi_setup_handler, .user_ctx = nullptr,
+        .is_websocket = false, .handle_ws_control_frames = false,
+        .supported_subprotocol = nullptr,
+    };
+    httpd_register_uri_handler(s_httpd, &uri_root);
+
+    static const httpd_uri_t uri_scan = {
+        .uri = "/wifi/scan", .method = HTTP_GET,
+        .handler = wifi_scan_handler, .user_ctx = nullptr,
+        .is_websocket = false, .handle_ws_control_frames = false,
+        .supported_subprotocol = nullptr,
+    };
+    httpd_register_uri_handler(s_httpd, &uri_scan);
+
+    static const httpd_uri_t uri_save = {
+        .uri = "/wifi/save", .method = HTTP_POST,
+        .handler = wifi_save_handler, .user_ctx = nullptr,
+        .is_websocket = false, .handle_ws_control_frames = false,
+        .supported_subprotocol = nullptr,
+    };
+    httpd_register_uri_handler(s_httpd, &uri_save);
+
+    /* captive portal detection: Android /generate_204 → todo via 404 handler */
+    httpd_register_err_handler(s_httpd, HTTPD_404_NOT_FOUND, captive_404_handler);
+
+    ESP_LOGI(TAG, "Captive portal activo en http://192.168.4.1/");
+}
+
+/* ---- arrancar modo provisioning: SoftAP + DNS + captive portal ---- */
+static void wifi_start_provisioning(void)
+{
+    wifi_config_t ap_cfg = {};
+    memcpy(ap_cfg.ap.ssid, AP_SSID, strlen(AP_SSID));
+    ap_cfg.ap.ssid_len       = (uint8_t)strlen(AP_SSID);
+    ap_cfg.ap.channel        = AP_CHANNEL;
+    ap_cfg.ap.max_connection = AP_MAX_CONN;
+    ap_cfg.ap.authmode       = WIFI_AUTH_OPEN;
+
+    /* APSTA: AP visible + STA disponible para escaneo de redes */
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_cfg));
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    xTaskCreate(dns_server_task, "dns_srv", 4096, nullptr, 5, nullptr);
+    http_captive_server_init();
+
+    ESP_LOGI(TAG_WIFI, "Provisioning: conecta a WiFi '%s' → http://192.168.4.1/",
+             AP_SSID);
+}
+
+/* ================================================================== */
 /* ---- WiFi STA                                                  ---- */
-/* ------------------------------------------------------------------ */
+/* ================================================================== */
 
 static void wifi_event_handler(void *arg, esp_event_base_t event_base,
                                int32_t event_id, void *event_data)
@@ -742,8 +1110,9 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
             ESP_LOGW(TAG_WIFI, "Reintentando conexión (%d/%d)...",
                      s_wifi_retry_count, WIFI_RETRY_MAX);
         } else {
-            xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
-            ESP_LOGE(TAG_WIFI, "No se pudo conectar a '" WIFI_SSID "'");
+            if (s_wifi_event_group)
+                xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
+            ESP_LOGE(TAG_WIFI, "No se pudo conectar a la red WiFi guardada");
         }
 
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
@@ -756,22 +1125,18 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
             xSemaphoreGive(s_bms_mutex);
         }
         s_wifi_retry_count = 0;
-        xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+        if (s_wifi_event_group)
+            xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
     }
 }
 //-------------------------------------------------------------------
-static void wifi_init_sta(void)
+/* ---- intento de conexión WiFi STA con credenciales dadas ---- */
+/* Retorna true si se obtiene IP, false si falla o timeout.      */
+static bool wifi_try_sta(const char *ssid, const char *pass)
 {
     s_wifi_event_group = xEventGroupCreate();
+    s_wifi_retry_count = 0;
 
-    ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_create_default_wifi_sta();
-
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-
-    /* registrar handlers de eventos */
     esp_event_handler_instance_t instance_any_id;
     esp_event_handler_instance_t instance_got_ip;
     ESP_ERROR_CHECK(esp_event_handler_instance_register(
@@ -780,30 +1145,39 @@ static void wifi_init_sta(void)
         IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, nullptr, &instance_got_ip));
 
     wifi_config_t wifi_config = {};
-    strncpy((char *)wifi_config.sta.ssid,     WIFI_SSID, sizeof(wifi_config.sta.ssid) - 1);
-    strncpy((char *)wifi_config.sta.password, WIFI_PASS, sizeof(wifi_config.sta.password) - 1);
-    wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
-    wifi_config.sta.pmf_cfg.capable    = true;
-    wifi_config.sta.pmf_cfg.required   = false;
+    strncpy((char *)wifi_config.sta.ssid,     ssid, sizeof(wifi_config.sta.ssid) - 1);
+    strncpy((char *)wifi_config.sta.password, pass, sizeof(wifi_config.sta.password) - 1);
+    wifi_config.sta.threshold.authmode =
+        (pass[0] != '\0') ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
+    wifi_config.sta.pmf_cfg.capable  = true;
+    wifi_config.sta.pmf_cfg.required = false;
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    ESP_LOGI(TAG_WIFI, "Conectando a SSID: '" WIFI_SSID "'...");
+    ESP_LOGI(TAG_WIFI, "Conectando a SSID: '%s'...", ssid);
 
-    /* esperar resultado de la conexión inicial */
     EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
                                            WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
                                            pdFALSE, pdFALSE,
                                            pdMS_TO_TICKS(15000));
+
     if (bits & WIFI_CONNECTED_BIT) {
-        ESP_LOGI(TAG_WIFI, "Conectado a '" WIFI_SSID "'");
-    } else if (bits & WIFI_FAIL_BIT) {
-        ESP_LOGW(TAG_WIFI, "Falló la conexión WiFi — continuando sin red");
-    } else {
-        ESP_LOGW(TAG_WIFI, "Timeout esperando WiFi — continuando sin red");
+        ESP_LOGI(TAG_WIFI, "Conectado a '%s'", ssid);
+        /* dejar handlers registrados para gestionar reconexiones */
+        return true;
     }
+
+    ESP_LOGW(TAG_WIFI, "No se pudo conectar a '%s' — iniciando provisioning", ssid);
+
+    /* desregistrar handlers antes de parar WiFi para evitar race conditions */
+    esp_event_handler_instance_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID,   instance_any_id);
+    esp_event_handler_instance_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP, instance_got_ip);
+    esp_wifi_stop();
+    vEventGroupDelete(s_wifi_event_group);
+    s_wifi_event_group = nullptr;
+    return false;
 }
 //-------------------------------------------------------------------
 /* ---- tarea principal BLE (equivale a setup() + loop()) ---- */
@@ -825,13 +1199,16 @@ static void daly_ble_task(void *pvParameters)
         sendDalyRequest(0x92); delay(120);
         sendDalyRequest(0x93); delay(120);
         sendDalyRequest(0x95);
+        sendDalyRequest(0x96); delay(120);
         sendDalyRequest(0x97);
+        sendDalyRequest(0x98);
     } else {
         ESP_LOGW(TAG, "BMS no encontrado en el escaneo inicial");
     }
 
     /* loop() */
     static uint64_t lastPoll      = 0;
+    static uint64_t lastPoll98    = 0;
     static uint64_t lastReconnect = 0;
 
     for (;;) {
@@ -843,8 +1220,13 @@ static void daly_ble_task(void *pvParameters)
                 sendDalyRequest(0x93); delay(80);
                 sendDalyRequest(0x94); delay(150);
                 sendDalyRequest(0x95);
+                sendDalyRequest(0x96); delay(80);
                 sendDalyRequest(0x97);
                 lastPoll = millis();
+            }
+            if (millis() - lastPoll98 > 2000) {
+                sendDalyRequest(0x98);
+                lastPoll98 = millis();
             }
         } else {
             if (s_trigger_scan || (millis() - lastReconnect > 3000)) {
@@ -924,10 +1306,40 @@ extern "C" void app_main(void)
     /* Reducir verbosidad de NimBLE (oculta cada write/procedure GATT) */
     esp_log_level_set("NimBLE", ESP_LOG_WARN);
 
-    /* WiFi primero: inicializa netif y el event loop compartido con NimBLE */
-    wifi_init_sta();
+    /* Netif + event loop compartido con NimBLE — solo una vez */
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
 
-    /* HTTP server + WebSocket (requiere IP activa) */
+    /* Crear ambas interfaces (STA y AP) antes de inicializar el driver */
+    esp_netif_create_default_wifi_sta();
+    esp_netif_create_default_wifi_ap();
+
+    /* Inicializar driver WiFi (solo una vez) */
+    wifi_init_config_t wcfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&wcfg));
+
+    /* Intentar conectar con credenciales guardadas en NVS */
+    char saved_ssid[64] = {};
+    char saved_pass[64] = {};
+    bool has_creds = wifi_credentials_load(saved_ssid, sizeof(saved_ssid),
+                                           saved_pass, sizeof(saved_pass));
+    bool wifi_ok = false;
+
+    if (has_creds) {
+        ESP_LOGI(TAG_WIFI, "Credenciales guardadas: SSID='%s'", saved_ssid);
+        wifi_ok = wifi_try_sta(saved_ssid, saved_pass);
+    } else {
+        ESP_LOGW(TAG_WIFI, "No hay credenciales WiFi guardadas");
+    }
+
+    if (!wifi_ok) {
+        /* Sin WiFi: modo provisioning (SoftAP + DNS + captive portal) */
+        wifi_start_provisioning();
+        /* Loop indefinido — el restart se hace desde wifi_save_handler tras guardar */
+        while (1) vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+
+    /* Modo normal: HTTP server BMS + mDNS + BLE + remote push */
     http_server_init();
 
     /* mDNS: accesible como http://bms.local en la red local */
@@ -939,7 +1351,7 @@ extern "C" void app_main(void)
 
     xTaskCreate(daly_ble_task,    "daly_ble",    12288, nullptr, 5, nullptr);
     xTaskCreate(remote_push_task, "remote_push",  8192, nullptr, 3, nullptr);
-    while(1) {
+    while (1) {
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }

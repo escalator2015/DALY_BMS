@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Daly BMS</title>
+<title>BMS Monitor</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{background:#111;color:#ccc;font:13px/1.5 'JetBrains Mono','Fira Code',Consolas,monospace}
@@ -42,7 +42,7 @@ footer{border-top:1px solid #333;padding:8px 0;font-size:11px;color:#888;display
 <div class="wrap">
 
 <header>
-  <h1>&#9889; Daly BMS</h1>
+  <h1>&#9889; BMS Monitor</h1>
   <div class="meta">
     <span><span class="dot dr" id="ble-dot"></span><span id="ble-lbl">BLE: desconectado</span></span><br>
     <span id="wifi-ip">WiFi: --</span>
@@ -126,6 +126,18 @@ footer{border-top:1px solid #333;padding:8px 0;font-size:11px;color:#888;display
 <div class="card">
   <h2>Estado de Balanceo</h2>
   <div class="bal-grid" id="bal-grid"><span class="lbl">Sin datos</span></div>
+</div>
+
+<!-- Temperaturas individuales (0x96) -->
+<div class="card">
+  <h2>Temperaturas por Sensor</h2>
+  <div class="cell-grid" id="temps-grid"><span class="lbl">Sin datos</span></div>
+</div>
+
+<!-- Alarmas (0x98) -->
+<div class="card" id="alarms-card">
+  <h2>Alarmas</h2>
+  <div class="bal-grid" id="alarms-grid"><span class="lbl">Sin datos</span></div>
 </div>
 
 <footer>
@@ -254,6 +266,53 @@ footer{border-top:1px solid #333;padding:8px 0;font-size:11px;color:#888;display
             + '</div>';
       }
       bg.innerHTML = h2;
+    }
+
+    /* Cell temperatures (0x96) */
+    if(d.cell_temps && d.cell_temps.length){
+      var tg = g("temps-grid"), ht = "";
+      for(var k = 0; k < d.cell_temps.length; k++){
+        var tv = d.cell_temps[k];
+        var tc = tv > 45 ? "#c44" : tv > 35 ? "#e8a030" : "#4a4";
+        ht += '<div class="cell-item">'
+            + '<div class="cn">S' + (k+1) + '</div>'
+            + '<div class="cv" style="color:' + tc + '">' + fmt1(tv) + ' \u00b0C</div>'
+            + '</div>';
+      }
+      tg.innerHTML = ht;
+    }
+
+    /* Alarms (0x98) */
+    if(d.alarms){
+      var al = d.alarms;
+      var alDefs = [
+        ["cell_overvolt",  "Sobretensión celda"],
+        ["cell_undervolt", "Subtensión celda"],
+        ["pack_overvolt",  "Sobretensión pack"],
+        ["pack_undervolt", "Subtensión pack"],
+        ["chg_overtemp",   "Sobretemperatura carga"],
+        ["chg_undertemp",  "Subtemperatura carga"],
+        ["dis_overtemp",   "Sobretemperatura descarga"],
+        ["dis_undertemp",  "Subtemperatura descarga"],
+        ["chg_overcurrent","Sobrecorriente carga"],
+        ["dis_overcurrent","Sobrecorriente descarga"],
+        ["short_circuit",  "Cortocircuito"],
+        ["ic_error",       "Error IC"],
+        ["mos_lock",       "MOS bloqueado"]
+      ];
+      var ag = g("alarms-grid"), ha = "";
+      var anyActive = false;
+      for(var ai = 0; ai < alDefs.length; ai++){
+        var aKey = alDefs[ai][0], aLbl = alDefs[ai][1];
+        var aVal = al[aKey];
+        if(aVal) anyActive = true;
+        ha += '<div class="bal-item" style="' + (aVal ? 'background:#2a0d0d;border:1px solid #c44' : '') + '">'
+            + '<span class="dot ' + (aVal ? 'dr' : 'dn') + '"></span>'
+            + '<span style="color:' + (aVal ? '#f88' : '#666') + '">' + aLbl + '</span>'
+            + '</div>';
+      }
+      ag.innerHTML = ha;
+      g("alarms-card").style.borderColor = anyActive ? "#c44" : "#282828";
     }
 
     /* Footer */

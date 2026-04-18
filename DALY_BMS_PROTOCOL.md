@@ -129,14 +129,76 @@ payload[2] bits 0–7  → celdas 17–24
 
 ---
 
-## Comandos pendientes de implementar
+### `0x96` — Temperaturas individuales por sensor · multi-trama
 
-| CMD    | Nombre             | Dirección    | Descripción                                            |
-|--------|--------------------|--------------|--------------------------------------------------------|
-| `0x98` | Alarm flags        | BMS → Host   | 32 bits de alarmas activas (sobrevoltaje, sobretemp…)  |
-| `0x44` | Set charge MOS     | Host → BMS   | Escritura: activar/desactivar MOSFET de carga          |
-| `0x45` | Set discharge MOS  | Host → BMS   | Escritura: activar/desactivar MOSFET de descarga       |
-| `0x00` | SOC reset          | Host → BMS   | Escritura: resetear SOC al 100%                        |
+Caben 7 sensores por trama:
+
+| Bytes payload | Campo             | Descripción                                       |
+|---------------|-------------------|---------------------------------------------------|
+| [0]           | `frame_number`    | Índice de trama, 1-based                          |
+| [1]–[7]       | `temp_sensor_N`   | raw − 40 → °C · sensores base+(0…6)               |
+
+- Tramas necesarias: `⌈temp_sensor_count / 7⌉`
+- Fórmula: `°C = raw − 40` (raw=40 → 0 °C; raw=1 → −39 °C)
+- Usar `0x94.temp_sensor_count` para saber cuántos sensores existen
+
+---
+
+### `0x98` — Flags de alarma · polling cada 2 s
+
+Los bytes del payload son un mapa de bits; los más relevantes:
+
+| Byte | Bit | Campo               | Descripción                     |
+|------|-----|---------------------|---------------------------------|
+| [0]  | 7   | `cell_overvolt`     | Sobretensión de celda           |
+| [0]  | 6   | `cell_undervolt`    | Subtensión de celda             |
+| [0]  | 5   | `pack_overvolt`     | Sobretensión del pack           |
+| [0]  | 4   | `pack_undervolt`    | Subtensión del pack             |
+| [0]  | 3   | `chg_overtemp`      | Sobretemperatura en carga       |
+| [0]  | 2   | `chg_undertemp`     | Subtemperatura en carga         |
+| [0]  | 1   | `dis_overtemp`      | Sobretemperatura en descarga    |
+| [0]  | 0   | `dis_undertemp`     | Subtemperatura en descarga      |
+| [1]  | 7   | `chg_overcurrent`   | Sobrecorriente en carga         |
+| [1]  | 6   | `dis_overcurrent`   | Sobrecorriente en descarga      |
+| [1]  | 5   | `short_circuit`     | Cortocircuito                   |
+| [1]  | 4   | `ic_error`          | Error interno de IC             |
+| [1]  | 3   | `mos_lock`          | MOS bloqueado por software      |
+
+> El firmware almacena los 4 bytes como `uint32_t alarm_flags` y expone cada bit por nombre en el JSON.
+
+---
+
+## Comandos de escritura (Host → BMS)
+
+### `0x44` — Activar/desactivar MOSFET de carga
+
+| Bytes payload | Campo    | Valores         | Descripción               |
+|---------------|----------|-----------------|---------------------------|
+| [0]           | `enable` | `0x01`=ON, `0x00`=OFF | Control MOSFET carga |
+| [1–7]         | reservado | `0x00`         |                           |
+
+Comando WebSocket: `{ "cmd": "set_charge_mos", "enable": true|false }`
+
+---
+
+### `0x45` — Activar/desactivar MOSFET de descarga
+
+| Bytes payload | Campo    | Valores         | Descripción               |
+|---------------|----------|-----------------|---------------------------|
+| [0]           | `enable` | `0x01`=ON, `0x00`=OFF | Control MOSFET descarga |
+| [1–7]         | reservado | `0x00`         |                           |
+
+Comando WebSocket: `{ "cmd": "set_discharge_mos", "enable": true|false }`
+
+---
+
+### `0x00` — Reset SOC al 100%
+
+Sin payload significativo (8 bytes a `0x00`). El BMS recalcula el SOC al 100%.
+
+Comando WebSocket: `{ "cmd": "reset_soc" }`
+
+> **Advertencia**: estos comandos actúan directamente sobre el hardware del BMS. Usarlos solo con intención deliberada.
 
 ---
 
@@ -144,11 +206,10 @@ payload[2] bits 0–7  → celdas 17–24
 
 ```
 Arranque:     0x94 (config) → esperar 200 ms
-              → 0x90, 0x91, 0x92, 0x93, 0x95, 0x97
+              → 0x90, 0x91, 0x92, 0x93, 0x95, 0x96, 0x97, 0x98
 
-Cada 1 s:     0x90, 0x91, 0x92, 0x93
-Cada 5 s:     0x94, 0x95, 0x97
-Cada 2 s:     0x98 (cuando esté implementado)
+Cada 1 s:     0x90, 0x91, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97
+Cada 2 s:     0x98
 ```
 
 ---
@@ -168,7 +229,17 @@ Cada 2 s:     0x98 (cuando esté implementado)
   "state":   { "mode": 0, "mode_str": "Stationary", "c_mos": true, "d_mos": true, "rem_mah": 45000 },
   "cfg":     { "cells": 16, "temps": 2, "charger": false, "load": true, "cycles": 42 },
   "voltages": [4.125, 4.120, 4.110, 4.098, ...],
+  "cell_temps": [28.0, 25.5],
   "balance":  [false, false, true, false, ...],
+  "alarms": {
+    "flags": 0,
+    "cell_overvolt": false, "cell_undervolt": false,
+    "pack_overvolt": false, "pack_undervolt": false,
+    "chg_overtemp": false, "chg_undertemp": false,
+    "dis_overtemp": false, "dis_undertemp": false,
+    "chg_overcurrent": false, "dis_overcurrent": false,
+    "short_circuit": false, "ic_error": false, "mos_lock": false
+  },
   "uptime":  3600,
   "heap":    180000
 }
@@ -181,6 +252,9 @@ Cada 2 s:     0x98 (cuando esté implementado)
 { "cmd": "disconnect" }
 { "cmd": "scan" }
 { "cmd": "request", "code": 144 }
+{ "cmd": "set_charge_mos",    "enable": true }
+{ "cmd": "set_discharge_mos", "enable": false }
+{ "cmd": "reset_soc" }
 ```
 
 > `code` es el byte del comando en decimal: 0x90=144, 0x91=145, 0x95=149, 0x97=151, etc.
