@@ -37,6 +37,9 @@ header .meta{font-size:11px;color:#888;text-align:right;line-height:1.8}
 .btn-red{background:#c44;color:#fff}.btn-red:hover{background:#d55}
 .btn-grey{background:#333;color:#aaa}.btn-grey:hover{background:#444}
 footer{border-top:1px solid #333;padding:8px 0;font-size:11px;color:#888;display:flex;justify-content:space-between;flex-wrap:wrap;gap:4px;margin-top:4px}
+.hist-ctrl{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:6px;margin-bottom:10px}
+.hist-sublbl{font-size:10px;color:#aaa;text-transform:uppercase;letter-spacing:1px;margin:8px 0 2px}
+.hvbtn{background:#333;color:#aaa}.hvbtn:hover{background:#444}.hvbtn.active{background:#e8a030;color:#111}
 #overlay{display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.85);z-index:99;justify-content:center;align-items:center}
 #overlay.show{display:flex}
 #overlay .box{background:#1a1a1a;border:1px solid #e8a030;border-radius:6px;padding:20px 30px;text-align:center;color:#ccc}
@@ -146,6 +149,31 @@ footer{border-top:1px solid #333;padding:8px 0;font-size:11px;color:#888;display
 <div class="card" id="alarms-card">
   <h2>Alarmas</h2>
   <div class="bal-grid" id="alarms-grid"><span class="lbl">Sin datos</span></div>
+</div>
+
+<!-- Histórico BMS -->
+<div class="card">
+  <h2>Hist&#243;rico</h2>
+  <div class="hist-ctrl">
+    <div>
+      <button class="btn hvbtn active" id="hv-day"   onclick="histSetView('day')">D&#237;a</button>
+      <button class="btn hvbtn"        id="hv-week"  onclick="histSetView('week')">Semana</button>
+      <button class="btn hvbtn"        id="hv-month" onclick="histSetView('month')">Mes</button>
+      <button class="btn hvbtn"        id="hv-year"  onclick="histSetView('year')">A&#241;o</button>
+    </div>
+    <div style="display:flex;gap:6px;align-items:center">
+      <button class="btn btn-grey" onclick="histShift(-1)">&#8592;</button>
+      <span class="lbl" id="hist-period" style="min-width:110px;text-align:center">--</span>
+      <button class="btn btn-grey" onclick="histShift(1)">&#8594;</button>
+    </div>
+  </div>
+  <div class="hist-sublbl">Voltaje (V)</div>
+  <div style="position:relative;height:140px;margin-bottom:8px"><canvas id="chart-v"></canvas></div>
+  <div class="hist-sublbl">Corriente (A) &#8212; negativo = descarga</div>
+  <div style="position:relative;height:140px;margin-bottom:8px"><canvas id="chart-i"></canvas></div>
+  <div class="hist-sublbl">Potencia (W) &#8212; negativa = descarga neta</div>
+  <div style="position:relative;height:140px"><canvas id="chart-p"></canvas></div>
+  <div style="text-align:center;font-size:10px;color:#aaa;margin-top:6px" id="hist-status"></div>
 </div>
 
 <!-- Control BLE -->
@@ -325,7 +353,7 @@ footer{border-top:1px solid #333;padding:8px 0;font-size:11px;color:#888;display
         if(aVal) anyActive = true;
         ha += '<div class="bal-item" style="' + (aVal ? 'background:#2a0d0d;border:1px solid #c44' : '') + '">'
             + '<span class="dot ' + (aVal ? 'dr' : 'dn') + '"></span>'
-            + '<span style="color:' + (aVal ? '#f88' : '#666') + '">' + aLbl + '</span>'
+            + '<span style="color:' + (aVal ? '#f88' : '#aaa') + '">' + aLbl + '</span>'
             + '</div>';
       }
       ag.innerHTML = ha;
@@ -367,6 +395,183 @@ footer{border-top:1px solid #333;padding:8px 0;font-size:11px;color:#888;display
   };
 
   wsConn();
+})();
+</script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
+<script>
+/* ================================================================== */
+/* ---- Histórico BMS — Chart.js                                  ---- */
+/* ================================================================== */
+(function () {
+  'use strict';
+  var HIST_URL = '/history';
+  var hView = 'day', hTs = 0;
+  var cV, cI, cP;
+
+  /* ---- Opciones comunes de Chart.js ---- */
+  function makeOpts(unit) {
+    return {
+      responsive: true, maintainAspectRatio: false, animation: false,
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          backgroundColor: '#1a1a1a', borderColor: '#333', borderWidth: 1,
+          titleColor: '#888', bodyColor: '#ccc',
+          callbacks: { label: function (ctx) {
+            return ctx.raw != null ? Number(ctx.raw).toFixed(2) + ' ' + unit : '--';
+          }}
+        }
+      },
+      scales: {
+        x: { ticks: { color: '#bbb', font: { size: 9 }, maxRotation: 45,
+                       autoSkip: true, maxTicksLimit: 12 },
+             grid: { color: '#1e1e1e' } },
+        y: { ticks: { color: '#ccc', font: { size: 9 } }, grid: { color: '#222' },
+             title: { display: true, text: unit, color: '#aaa', font: { size: 9 } } }
+      }
+    };
+  }
+
+  /* ---- Color dinámico por signo del valor ---- */
+  function dynColor(pos, neg) {
+    return function (ctx) {
+      return (ctx.raw != null && ctx.raw < 0) ? neg : pos;
+    };
+  }
+
+  function initCharts() {
+    Chart.defaults.font.family = "'JetBrains Mono','Fira Code',Consolas,monospace";
+    function mkDs(lineColor) {
+      return [{ data: [], borderColor: lineColor, borderWidth: 1.5,
+                pointRadius: 0, pointHitRadius: 8,
+                fill: false, tension: 0.3, spanGaps: false }];
+    }
+    cV = new Chart(document.getElementById('chart-v'),
+      { type: 'line', data: { labels: [], datasets: mkDs('#e8a030') }, options: makeOpts('V') });
+    cI = new Chart(document.getElementById('chart-i'),
+      { type: 'line', data: { labels: [], datasets: mkDs('#4a4') }, options: makeOpts('A') });
+    cP = new Chart(document.getElementById('chart-p'),
+      { type: 'line', data: { labels: [], datasets: mkDs('#4a9eff') }, options: makeOpts('W') });
+  }
+
+  /* ---- Etiqueta de eje X según vista ---- */
+  function mkLabel(ts, view) {
+    var d = new Date(ts * 1000);
+    var p = function (n) { return String(n).padStart(2, '0'); };
+    if (view === 'day')   return p(d.getHours()) + ':' + p(d.getMinutes());
+    if (view === 'week')  return p(d.getDate()) + '/' + p(d.getMonth() + 1) + ' ' + d.getHours() + 'h';
+    if (view === 'month') return p(d.getDate()) + '/' + p(d.getMonth() + 1);
+    /* year: número de semana */
+    var jan1 = new Date(d.getFullYear(), 0, 1);
+    var wk = Math.ceil(((d - jan1) / 86400000 + jan1.getDay() + 1) / 7);
+    return MN[d.getMonth()].charAt(0).toUpperCase() + MN[d.getMonth()].slice(1);
+  }
+
+  /* ---- Etiqueta de período para el botón de navegación ---- */
+  var MN = ['ene','feb','mar','abr','may','jun','jul','ago','sep','oct','nov','dic'];
+  function periodLabel(ts, view) {
+    var d = new Date(ts * 1000);
+    if (view === 'day')   return d.getDate() + ' ' + MN[d.getMonth()] + ' ' + d.getFullYear();
+    if (view === 'week')  {
+      var d2 = new Date((ts + 6 * 86400) * 1000);
+      return d.getDate() + ' ' + MN[d.getMonth()] + ' \u2013 ' + d2.getDate() + ' ' + MN[d2.getMonth()];
+    }
+    if (view === 'month') return MN[d.getMonth()].charAt(0).toUpperCase() +
+                                 MN[d.getMonth()].slice(1) + ' ' + d.getFullYear();
+    return String(d.getFullYear());
+  }
+
+  /* ---- Inicio del período actual ---- */
+  function periodStart(view) {
+    var d = new Date();
+    if (view === 'day')   { d.setHours(0, 0, 0, 0); }
+    else if (view === 'week')  {
+      var diff = (d.getDay() === 0) ? 6 : d.getDay() - 1;
+      d.setDate(d.getDate() - diff); d.setHours(0, 0, 0, 0);
+    }
+    else if (view === 'month') { d.setDate(1); d.setHours(0, 0, 0, 0); }
+    else                       { d.setMonth(0, 1); d.setHours(0, 0, 0, 0); }
+    return Math.floor(d.getTime() / 1000);
+  }
+
+  /* ---- Seleccionar vista ---- */
+  window.histSetView = function (v) {
+    hView = v; hTs = periodStart(v);
+    ['day','week','month','year'].forEach(function (x) {
+      var b = document.getElementById('hv-' + x);
+      if (b) b.className = 'btn hvbtn' + (x === v ? ' active' : '');
+    });
+    histFetch();
+  };
+
+  /* ---- Navegar período ---- */
+  window.histShift = function (delta) {
+    var d = new Date(hTs * 1000);
+    if      (hView === 'day')   d.setDate(d.getDate() + delta);
+    else if (hView === 'week')  d.setDate(d.getDate() + 7 * delta);
+    else if (hView === 'month') d.setMonth(d.getMonth() + delta);
+    else                        d.setFullYear(d.getFullYear() + delta);
+    hTs = Math.floor(d.getTime() / 1000);
+    histFetch();
+  };
+
+  /* ---- Cargar y renderizar ---- */
+  function histFetch() {
+    if (!cV) return;
+    var url = HIST_URL + '?view=' + hView + '&ts=' + hTs;
+    var elSt  = document.getElementById('hist-status');
+    var elPer = document.getElementById('hist-period');
+    if (elSt)  elSt.textContent  = 'Cargando\u2026';
+    if (elPer) elPer.textContent = periodLabel(hTs, hView);
+    fetch(url)
+      .then(function (r) { return r.json(); })
+      .then(function (data) {
+        /* Eje fijo: siempre el per\u00edodo completo, sin autoescala en X */
+        var N      = { day: 288, week: 168, month: 31, year: 12 }[hView] || 288;
+        var bktS   = data.bucket_s || { day: 300, week: 3600, month: 86400, year: 2635200 }[hView];
+        var tsBase = data.ts_start != null ? +data.ts_start : hTs;
+        /* Mapa ts \u2192 bucket recibido */
+        var map = {};
+        if (data.buckets) {
+          data.buckets.forEach(function (b) { map[+b.ts] = b; });
+        }
+        /* Generar eje completo; null donde no hay dato (sin barra) */
+        var labels = [], vArr = [], iArr = [], pArr = [], dataCount = 0;
+        for (var i = 0; i < N; i++) {
+          var bts = tsBase + i * bktS;
+          labels.push(mkLabel(bts, hView));
+          var b = map[bts];
+          if (b) {
+            vArr.push(+b.v); iArr.push(+b.i); pArr.push(+b.p);
+            dataCount++;
+          } else {
+            vArr.push(null); iArr.push(null); pArr.push(null);
+          }
+        }
+        cV.data.labels = labels; cV.data.datasets[0].data = vArr; cV.update('none');
+        cI.data.labels = labels; cI.data.datasets[0].data = iArr; cI.update('none');
+        cP.data.labels = labels; cP.data.datasets[0].data = pArr; cP.update('none');
+        if (elSt) elSt.textContent = dataCount
+          ? dataCount + ' puntos'
+          : 'Sin datos para este per\u00edodo';
+      })
+      .catch(function (err) {
+        if (elSt) elSt.textContent = 'Error: ' + err.message;
+      });
+  }
+
+  /* ---- Arranque: esperar a que Chart.js cargue ---- */
+  function start() {
+    if (typeof Chart === 'undefined') { setTimeout(start, 100); return; }
+    initCharts();
+    hTs = periodStart(hView);
+    histSetView(hView);
+  }
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', start);
+  } else {
+    start();
+  }
 })();
 </script>
 </body>

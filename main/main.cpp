@@ -31,6 +31,10 @@
 #include "nvs.h"
 #include "esp_system.h"
 #include "lwip/sockets.h"
+#include "esp_spiffs.h"
+#include "esp_sntp.h"
+#include <time.h>
+#include <sys/time.h>
 
 static const char *TAG     = "DALY_BLE";
 static const char *TAG_WIFI = "WIFI";
@@ -64,6 +68,15 @@ static int                s_wifi_retry_count  = 0;
 #define REMOTE_PUSH_URL   "https://luaresearch.es/bms/update.php"  /* cambiar por tu dominio */
 #define REMOTE_API_KEY    "c864645245ca1dcd5d6a0d6ca3754512c26a7a07ff722c853d1587b18bf1916f"              /* igual que en update.php */
 #define REMOTE_PUSH_MS    5000                                     /* intervalo push en ms */
+
+/* ---- Push histórico remoto ---- */
+#define REMOTE_HIST_URL   "https://luaresearch.es/bms/update_history.php"
+#define REMOTE_HIST_USER  "lua"   /* usuario HTTP Basic del servidor */
+#define REMOTE_HIST_PASS  "0304"        /* contraseña HTTP Basic (dejar vacío si no hay) */
+/* ---- Intervalo de agregación: 5 minutos ---- */
+#define HIST_INTERVAL_S   60
+/* ---- Epoch mínima para considerar SNTP sincronizado (2020-01-01) ---- */
+#define SNTP_EPOCH_MIN    1577836800UL
 //-------------------------------------------------------------------
 /* ---- sustitutos de millis() / delay() de Arduino ---- */
 static inline uint64_t millis(void)
@@ -139,6 +152,19 @@ struct BmsState {
 };
 static BmsState          s_bms       = {};
 static SemaphoreHandle_t s_bms_mutex = nullptr;
+
+/* ---- Registro histórico binario (12 bytes por entrada) ---- */
+typedef struct {
+    uint32_t ts;       /* Unix timestamp inicio del intervalo */
+    float    voltage;  /* promedio voltaje (V) */
+    float    current;  /* promedio corriente (A, negativo = descarga) */
+} HistRecord;
+
+/* ---- Acumuladores 1 Hz → promedio 5 min ---- */
+static float             s_volt_sum   = 0.0f;
+static float             s_curr_sum   = 0.0f;
+static int               s_sample_cnt = 0;
+static SemaphoreHandle_t s_hist_mutex = nullptr;
 
 /* ---- HTTP / WebSocket globals ---- */
 #define WS_MAX_CLIENTS 4
@@ -637,6 +663,275 @@ static char *build_status_json(void)
     return str;
 }
 //-------------------------------------------------------------------
+/* ================================================================== */
+/* ---- SPIFFS, SNTP e hist\u00f3rico                                  ---- */
+/* ================================================================== */
+
+/* ---- Montar SPIFFS ---- */
+static void spiffs_init(void)
+{
+    esp_vfs_spiffs_conf_t conf = {
+        .base_path              = "/spiffs",
+        .partition_label        = nullptr,
+        .max_files              = 4,
+        .format_if_mount_failed = true,
+    };
+    esp_err_t ret = esp_vfs_spiffs_register(&conf);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "SPIFFS mount fall\u00f3: %s", esp_err_to_name(ret));
+    } else {
+        size_t total = 0, used = 0;
+        esp_spiffs_info(nullptr, &total, &used);
+        ESP_LOGI(TAG, "SPIFFS montado: %u KB total, %u KB usado",
+                 (unsigned)(total / 1024), (unsigned)(used / 1024));
+    }
+}
+
+/* ---- Iniciar SNTP (llamar tras tener IP) ---- */
+static void sntp_init_fn(void)
+{
+    esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
+    esp_sntp_setservername(0, "pool.ntp.org");
+    esp_sntp_setservername(1, "time.google.com");
+    esp_sntp_init();
+    ESP_LOGI(TAG, "SNTP iniciado");
+}
+
+/* ---- Ruta del archivo binario de hist\u00f3rico seg\u00fan a\u00f1o ---- */
+static void hist_file_path(int year, char *buf, size_t buf_len)
+{
+    snprintf(buf, buf_len, "/spiffs/hist_%d.bin", year);
+}
+
+/* ---- Borra archivos con a\u00f1o < current_year - 1 (conserva actual + anterior) ---- */
+static void cleanup_old_hist_files(int current_year)
+{
+    char path[32];
+    for (int y = current_year - 6; y < current_year - 1; y++) {
+        hist_file_path(y, path, sizeof(path));
+        remove(path);  /* silencioso si no existe */
+    }
+}
+
+/* ---- Añade un registro al archivo binario del a\u00f1o correspondiente ---- */
+static void append_hist_record(const HistRecord *rec)
+{
+    time_t t = (time_t)rec->ts;
+    struct tm tm_info;
+    localtime_r(&t, &tm_info);
+    int year = tm_info.tm_year + 1900;
+    char path[32];
+    hist_file_path(year, path, sizeof(path));
+    FILE *f = fopen(path, "ab");
+    if (!f) {
+        ESP_LOGW(TAG, "Hist: no se pudo abrir %s", path);
+        return;
+    }
+    fwrite(rec, sizeof(HistRecord), 1, f);
+    fclose(f);
+    ESP_LOGD(TAG, "Hist: ts=%lu v=%.2f i=%.2f \u2192 %s",
+             (unsigned long)rec->ts, rec->voltage, rec->current, path);
+}
+
+/* ---- Push de muestra histórica al servidor PHP ---- */
+static void remote_push_hist(const HistRecord *rec)
+{
+    {
+        xSemaphoreTake(s_bms_mutex, portMAX_DELAY);
+        bool has_ip = (s_bms.wifi_ip[0] != '\0');
+        xSemaphoreGive(s_bms_mutex);
+        if (!has_ip) return;
+    }
+    char body[96];
+    snprintf(body, sizeof(body), "{\"ts\":%lu,\"v\":%.3f,\"i\":%.3f}",
+             (unsigned long)rec->ts, rec->voltage, rec->current);
+
+    esp_http_client_config_t cfg = {};
+    cfg.url               = REMOTE_HIST_URL;
+    cfg.method            = HTTP_METHOD_POST;
+    cfg.crt_bundle_attach = esp_crt_bundle_attach;
+    cfg.timeout_ms        = 8000;
+    /* Basic auth nativa: envía las credenciales de forma preemptiva sin esperar 401 */
+    cfg.username          = REMOTE_HIST_USER;
+    cfg.password          = REMOTE_HIST_PASS;
+    cfg.auth_type         = HTTP_AUTH_TYPE_BASIC;
+
+    esp_http_client_handle_t client = esp_http_client_init(&cfg);
+    esp_http_client_set_header(client, "Content-Type", "application/json");
+    esp_http_client_set_header(client, "X-API-Key",    REMOTE_API_KEY);
+    esp_http_client_set_post_field(client, body, (int)strlen(body));
+
+    esp_err_t err = esp_http_client_perform(client);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "Push hist remoto: HTTP %d",
+                 esp_http_client_get_status_code(client));
+    } else {
+        ESP_LOGW(TAG, "Push hist remoto falló: %s", esp_err_to_name(err));
+    }
+    esp_http_client_cleanup(client);
+}
+
+/* ---- Tarea: agrega muestra cada 5 min y escribe en SPIFFS ---- */
+static void hist_task(void *pvParameters)
+{
+    /* Esperar sync SNTP (m\u00e1x ~5 min antes de empezar) */
+    for (;;) {
+        if (time(nullptr) > (time_t)SNTP_EPOCH_MIN) break;
+        vTaskDelay(pdMS_TO_TICKS(5000));
+    }
+    ESP_LOGI(TAG, "SNTP sincronizado \u2014 hist\u00f3rico activado");
+
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS((uint32_t)HIST_INTERVAL_S * 1000));
+
+        time_t now = time(nullptr);
+        if (now <= (time_t)SNTP_EPOCH_MIN) continue;
+
+        /* Leer y resetear acumuladores */
+        float volt_avg = 0.0f, curr_avg = 0.0f;
+        int   cnt      = 0;
+        xSemaphoreTake(s_hist_mutex, portMAX_DELAY);
+        if (s_sample_cnt > 0) {
+            volt_avg = s_volt_sum / (float)s_sample_cnt;
+            curr_avg = s_curr_sum / (float)s_sample_cnt;
+            cnt      = s_sample_cnt;
+        }
+        s_volt_sum   = 0.0f;
+        s_curr_sum   = 0.0f;
+        s_sample_cnt = 0;
+        xSemaphoreGive(s_hist_mutex);
+
+        if (cnt == 0) continue;  /* sin lecturas BLE en este intervalo */
+
+        HistRecord rec;
+        rec.ts      = (uint32_t)(now - HIST_INTERVAL_S);  /* inicio del intervalo */
+        rec.voltage = volt_avg;
+        rec.current = curr_avg;
+
+        append_hist_record(&rec);
+        remote_push_hist(&rec);
+
+        struct tm tm_now;
+        localtime_r(&now, &tm_now);
+        cleanup_old_hist_files(tm_now.tm_year + 1900);
+    }
+}
+
+/* ================================================================== */
+/* ---- Endpoint GET /history                                     ---- */
+/* ================================================================== */
+
+struct HistBucket {
+    float v_sum;
+    float i_sum;
+    int   count;
+};
+
+static esp_err_t history_handler(httpd_req_t *req)
+{
+    char view[8]   = "day";
+    char ts_str[14] = "0";
+
+    char qbuf[48] = {};
+    if (httpd_req_get_url_query_str(req, qbuf, sizeof(qbuf)) == ESP_OK) {
+        httpd_query_key_value(qbuf, "view", view,   sizeof(view));
+        httpd_query_key_value(qbuf, "ts",   ts_str, sizeof(ts_str));
+    }
+
+    uint32_t ts_start = (uint32_t)strtoul(ts_str, nullptr, 10);
+    if (ts_start == 0) {
+        /* Por defecto: inicio del día actual (UTC).
+         * timegm() no está disponible en newlib; calculamos el epoch UTC manualmente
+         * restando los segundos del día actual de time(). */
+        time_t now = time(nullptr);
+        struct tm tm_now;
+        gmtime_r(&now, &tm_now);
+        uint32_t secs_today = (uint32_t)tm_now.tm_hour * 3600u
+                            + (uint32_t)tm_now.tm_min  * 60u
+                            + (uint32_t)tm_now.tm_sec;
+        ts_start = (uint32_t)now - secs_today;
+    }
+
+    /* Configuraci\u00f3n de la vista */
+    uint32_t period_s, bucket_s;
+    int      n_buckets;
+    if (strcmp(view, "week") == 0) {
+        bucket_s  = 3600;    n_buckets = 168; period_s = 7u * 86400u;
+    } else if (strcmp(view, "month") == 0) {
+        bucket_s  = 86400;   n_buckets = 31;  period_s = 31u * 86400u;
+    } else if (strcmp(view, "year") == 0) {
+        bucket_s  = 2635200;  n_buckets = 12;  period_s = 366u * 86400u;
+    } else {   /* day */
+        bucket_s  = 300;     n_buckets = 288; period_s = 86400u;
+    }
+
+    uint32_t ts_end = ts_start + period_s;
+
+    HistBucket *buckets = (HistBucket *)calloc(n_buckets, sizeof(HistBucket));
+    if (!buckets) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
+        return ESP_FAIL;
+    }
+
+    /* Determinar a\u00f1os que cubre el rango */
+    struct tm tm1, tm2;
+    time_t t1 = (time_t)ts_start, t2 = (time_t)(ts_end - 1);
+    gmtime_r(&t1, &tm1);
+    gmtime_r(&t2, &tm2);
+    int year1 = tm1.tm_year + 1900;
+    int year2 = tm2.tm_year + 1900;
+
+    for (int year = year1; year <= year2; year++) {
+        char path[32];
+        hist_file_path(year, path, sizeof(path));
+        FILE *f = fopen(path, "rb");
+        if (!f) continue;
+        HistRecord recs[64];
+        size_t n;
+        while ((n = fread(recs, sizeof(HistRecord), 64, f)) > 0) {
+            for (size_t k = 0; k < n; k++) {
+                uint32_t rts = recs[k].ts;
+                if (rts < ts_start || rts >= ts_end) continue;
+                int bidx = (int)((rts - ts_start) / bucket_s);
+                if (bidx < 0 || bidx >= n_buckets) continue;
+                buckets[bidx].v_sum  += recs[k].voltage;
+                buckets[bidx].i_sum  += recs[k].current;
+                buckets[bidx].count++;
+            }
+        }
+        fclose(f);
+    }
+
+    /* Respuesta JSON en chunks */
+    httpd_resp_set_type(req, "application/json");
+    char hdr[128];
+    int hlen = snprintf(hdr, sizeof(hdr),
+        "{\"view\":\"%s\",\"ts_start\":%lu,\"bucket_s\":%lu,\"buckets\":[",
+        view, (unsigned long)ts_start, (unsigned long)bucket_s);
+    httpd_resp_send_chunk(req, hdr, hlen);
+
+    bool first = true;
+    for (int b = 0; b < n_buckets; b++) {
+        if (buckets[b].count == 0) continue;
+        float avg_v = buckets[b].v_sum / (float)buckets[b].count;
+        float avg_i = buckets[b].i_sum / (float)buckets[b].count;
+        float avg_p = avg_v * avg_i;
+        uint32_t bts = ts_start + (uint32_t)b * bucket_s;
+        char entry[120];
+        int elen = snprintf(entry, sizeof(entry),
+            "%s{\"ts\":%lu,\"v\":%.2f,\"i\":%.2f,\"p\":%.1f}",
+            first ? "" : ",",
+            (unsigned long)bts, avg_v, avg_i, avg_p);
+        httpd_resp_send_chunk(req, entry, elen);
+        first = false;
+    }
+    httpd_resp_send_chunk(req, "]}", 2);
+    httpd_resp_send_chunk(req, nullptr, 0);
+
+    free(buckets);
+    return ESP_OK;
+}
+
 /* ---- envío async desde tarea al WebSocket ---- */
 struct ws_send_arg_t {
     httpd_handle_t hd;
@@ -667,6 +962,23 @@ static void ws_push_task(void *pvParameters)
 {
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(1000));
+
+        /* Acumular muestra para histórico (1 Hz, siempre activo) */
+        if (s_hist_mutex) {
+            xSemaphoreTake(s_bms_mutex, portMAX_DELAY);
+            bool  valid  = (s_bms.valid & (1u << 0)) != 0;
+            float v_now  = s_bms.voltage;
+            float i_now  = s_bms.current;
+            xSemaphoreGive(s_bms_mutex);
+            if (valid) {
+                xSemaphoreTake(s_hist_mutex, portMAX_DELAY);
+                s_volt_sum   += v_now;
+                s_curr_sum   += i_now;
+                s_sample_cnt++;
+                xSemaphoreGive(s_hist_mutex);
+            }
+        }
+
         if (!s_httpd) continue;
         char  *json = build_status_json();
         if (!json) continue;
@@ -775,7 +1087,7 @@ static void http_server_init(void)
 
     httpd_config_t cfg   = HTTPD_DEFAULT_CONFIG();
     cfg.lru_purge_enable = true;
-    cfg.max_open_sockets = WS_MAX_CLIENTS + 2;
+    cfg.max_open_sockets = WS_MAX_CLIENTS + 4;  /* +4: WS clients + HTTP histórico + margen */
 
     if (httpd_start(&s_httpd, &cfg) != ESP_OK) {
         ESP_LOGE(TAG, "Error iniciando HTTP server");
@@ -813,6 +1125,17 @@ static void http_server_init(void)
         .supported_subprotocol  = nullptr,
     };
     httpd_register_uri_handler(s_httpd, &favicon_uri);
+
+    static const httpd_uri_t history_uri = {
+        .uri                    = "/history",
+        .method                 = HTTP_GET,
+        .handler                = history_handler,
+        .user_ctx               = nullptr,
+        .is_websocket           = false,
+        .handle_ws_control_frames = false,
+        .supported_subprotocol  = nullptr,
+    };
+    httpd_register_uri_handler(s_httpd, &history_uri);
 
     ESP_LOGI(TAG, "HTTP server en http://%s/",
              s_bms.wifi_ip[0] ? s_bms.wifi_ip : "<ip pendiente>");
@@ -1303,8 +1626,17 @@ extern "C" void app_main(void)
     s_bms_mutex = xSemaphoreCreateMutex();
     configASSERT(s_bms_mutex);
 
+    /* Mutex para acumuladores históricos */
+    s_hist_mutex = xSemaphoreCreateMutex();
+    configASSERT(s_hist_mutex);
+
+    /* SPIFFS — almacén de datos históricos (antes de WiFi) */
+    spiffs_init();
+
     /* Reducir verbosidad de NimBLE (oculta cada write/procedure GATT) */
-    esp_log_level_set("NimBLE", ESP_LOG_WARN);
+    esp_log_level_set("NimBLE",      ESP_LOG_WARN);
+    esp_log_level_set("httpd_txrx",  ESP_LOG_ERROR);  /* silencia EAGAIN/ECONNRESET en WS */
+    esp_log_level_set("httpd_ws",    ESP_LOG_ERROR);  /* silencia WS header/payload send fail */
 
     /* Netif + event loop compartido con NimBLE — solo una vez */
     ESP_ERROR_CHECK(esp_netif_init());
@@ -1339,6 +1671,9 @@ extern "C" void app_main(void)
         while (1) vTaskDelay(pdMS_TO_TICKS(1000));
     }
 
+    /* WiFi ok: iniciar SNTP para sincronización horaria */
+    sntp_init_fn();
+
     /* Modo normal: HTTP server BMS + mDNS + BLE + remote push */
     http_server_init();
 
@@ -1351,6 +1686,7 @@ extern "C" void app_main(void)
 
     xTaskCreate(daly_ble_task,    "daly_ble",    12288, nullptr, 5, nullptr);
     xTaskCreate(remote_push_task, "remote_push",  8192, nullptr, 3, nullptr);
+    xTaskCreate(hist_task,        "hist",          4096, nullptr, 2, nullptr);
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(1000));
     }

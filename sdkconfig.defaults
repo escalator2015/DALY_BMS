@@ -17,6 +17,8 @@ CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=n
 # La mayoría de módulos ESP32-S3 tienen flash Quad/Octal; ajusta si es diferente
 CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
 CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
 
 # Habilitar Bluetooth
 CONFIG_BT_ENABLED=y
@@ -31,6 +33,9 @@ CONFIG_BT_NIMBLE_ROLE_OBSERVER=y
 
 # Una conexión simultánea es suficiente
 CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
+
+# LWIP: más sockets para HTTP server + WebSockets + historial
+CONFIG_LWIP_MAX_SOCKETS=16
 
 # BLE 5.0 (opcional, mejora rendimiento)
 CONFIG_BT_NIMBLE_50=y
