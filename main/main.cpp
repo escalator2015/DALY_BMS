@@ -193,7 +193,7 @@ static SemaphoreHandle_t s_bms_mutex = nullptr;
 typedef struct {
     uint32_t ts;       /* Unix timestamp inicio del intervalo */
     float    voltage;  /* promedio voltaje (V) */
-    float    current;  /* promedio corriente (A, negativo = descarga) */
+    float    current;  /* promedio corriente (A, positivo = carga, negativo = descarga) */
 } HistRecord;
 
 /* ---- Acumuladores 1 Hz → promedio 5 min ---- */
@@ -253,7 +253,7 @@ static void parseFrame(const uint8_t *frame)
             uint16_t current_raw = (payload[4] << 8) | payload[5];
             uint16_t soc_raw     = (payload[6] << 8) | payload[7];
             float v   = total_raw / 10.0f;
-            float i   = ((int)current_raw - 30000) / 10.0f;
+            float i   = (30000 - (int)current_raw) / 10.0f;
             float soc = soc_raw / 10.0f;
             xSemaphoreTake(s_bms_mutex, portMAX_DELAY);
             s_bms.voltage = v;  s_bms.current = i;  s_bms.soc = soc;
@@ -507,8 +507,8 @@ static void parseJkCellInfo(const uint8_t *d)
     uint32_t packV_raw   = jk_get_32bit(d, 150);      /* d[118+32] */
     int32_t  current_raw = (int32_t)jk_get_32bit(d, 158); /* d[126+32] */
     s_bms.voltage = packV_raw * 0.001f;
-    /* Convenio igual que DALY: positivo = descarga, negativo = carga */
-    s_bms.current = -(current_raw * 0.001f);
+    /* Convenio igual que LCD del BMS: positivo = carga, negativo = descarga */
+    s_bms.current = current_raw * 0.001f;
     s_bms.soc     = (float)d[173];                    /* d[141+32] */
     s_bms.valid  |= (1u << 0);
 
@@ -553,13 +553,13 @@ static void parseJkCellInfo(const uint8_t *d)
     s_bms.discharge_mos = (bool)d[199];               /* d[167+32] */
 
     /* Modo de carga derivado de la corriente */
-    if      (s_bms.current < -0.1f) s_bms.charge_mode = 1;   /* cargando */
-    else if (s_bms.current >  0.1f) s_bms.charge_mode = 2;   /* descargando */
+    if      (s_bms.current >  0.1f) s_bms.charge_mode = 1;   /* cargando */
+    else if (s_bms.current < -0.1f) s_bms.charge_mode = 2;   /* descargando */
     else                            s_bms.charge_mode = 0;    /* estacionario */
 
     /* Cargador y carga detectados */
     s_bms.charger = (bool)d[245];                     /* d[213+32] */
-    s_bms.load    = (s_bms.current > 0.1f);
+    s_bms.load    = (s_bms.current < -0.1f);
     s_bms.valid  |= (1u << 3);
 
     /* Alarmas (big-endian: d[166]=HI d[167]=LO para JK02_32S → d[134+32]) */
