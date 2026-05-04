@@ -36,14 +36,22 @@
 #include <time.h>
 #include <sys/time.h>
 
+#ifdef CONFIG_BMS_TYPE_DALY
 static const char *TAG     = "DALY_BLE";
+#else
+static const char *TAG     = "JK_BLE";
+#endif
 static const char *TAG_WIFI = "WIFI";
 
 /* ---- WiFi STA ---- */
 #define WIFI_RETRY_MAX   10
 
 /* ---- AP provisioning ---- */
-#define AP_SSID          "DALY-BMS-Setup"
+#ifdef CONFIG_BMS_TYPE_DALY
+#  define AP_SSID        "DALY-BMS-Setup"
+#else
+#  define AP_SSID        "JK-BMS-Setup"
+#endif
 #define AP_CHANNEL       1
 #define AP_MAX_CONN      4
 
@@ -59,10 +67,28 @@ static const char *TAG_WIFI = "WIFI";
 static EventGroupHandle_t s_wifi_event_group = nullptr;
 static int                s_wifi_retry_count  = 0;
 
-#define BMS_MAC_ADDRESS   "50:18:12:01:1b:68"  /* dirección MAC del BMS (en minúsculas) */
-#define SERVICE_UUID_MAIN "0000fff0-0000-1000-8000-00805f9b34fb"
-#define CHAR_UUID_TX      "0000fff1-0000-1000-8000-00805f9b34fb"  /* NOTIFY BMS→Host */
-#define CHAR_UUID_RX      "0000fff2-0000-1000-8000-00805f9b34fb"  /* WRITE  Host→BMS */
+/* ---- Dirección MAC del BMS (configurable vía menuconfig) ---- */
+#ifdef CONFIG_BMS_TYPE_DALY
+#  define BMS_MAC_ADDRESS   CONFIG_BMS_DALY_MAC_ADDRESS
+#else
+#  define BMS_MAC_ADDRESS   CONFIG_BMS_JK_MAC_ADDRESS
+#endif
+
+/* ---- UUIDs BLE según tipo de BMS ---- */
+#ifdef CONFIG_BMS_TYPE_DALY
+#  define SERVICE_UUID_MAIN "0000fff0-0000-1000-8000-00805f9b34fb"
+#  define CHAR_UUID_TX      "0000fff1-0000-1000-8000-00805f9b34fb"  /* NOTIFY BMS→Host */
+#  define CHAR_UUID_RX      "0000fff2-0000-1000-8000-00805f9b34fb"  /* WRITE  Host→BMS */
+#endif
+#ifdef CONFIG_BMS_TYPE_JK
+#  define SERVICE_UUID_MAIN "0000ffe0-0000-1000-8000-00805f9b34fb"
+#  define CHAR_UUID_TX      "0000ffe1-0000-1000-8000-00805f9b34fb"  /* NOTIFY BMS→Host */
+#  define CHAR_UUID_RX      "0000ffe1-0000-1000-8000-00805f9b34fb"  /* WRITE  Host→BMS */
+/* JK BMS: trama fija de 300 bytes, protocolo JK02_24S */
+#  define JK_FRAME_SIZE     300
+#  define JK_CMD_CELL_INFO  0x96
+#  define JK_CMD_DEV_INFO   0x97
+#endif
 
 /* ---- Push remoto a Hostalia ---- */
 #define REMOTE_PUSH_URL   "https://luaresearch.es/bms/update.php"  /* cambiar por tu dominio */
@@ -89,7 +115,10 @@ static inline void delay(uint32_t ms)
     vTaskDelay(pdMS_TO_TICKS(ms));
 }
 //-------------------------------------------------------------------
-/* ---- estado global (idéntico al original) ---- */
+/* ================================================================== */
+/* ---- Variables de ensamblado de trama DALY                    ---- */
+/* ================================================================== */
+#ifdef CONFIG_BMS_TYPE_DALY
 static int      expectedCellCount    = 12;
 static int      expectedFramesNeeded = (12 + 2) / 3;
 
@@ -104,6 +133,13 @@ static int  frameBase         = 0;
 
 static uint8_t rxStreamBuf[1024];
 static size_t  rxStreamLen = 0;
+#endif /* CONFIG_BMS_TYPE_DALY */
+
+#ifdef CONFIG_BMS_TYPE_JK
+/* ---- Buffer de trama JK (300 bytes fijos) ---- */
+static uint8_t  jkStreamBuf[JK_FRAME_SIZE + 32];
+static size_t   jkStreamLen = 0;
+#endif /* CONFIG_BMS_TYPE_JK */
 
 static NimBLEClient               *pClient           = nullptr;
 static NimBLERemoteCharacteristic *pTxCharacteristic = nullptr;
@@ -172,7 +208,12 @@ static httpd_handle_t    s_httpd       = nullptr;
 static int               s_ws_fds[WS_MAX_CLIENTS];
 static volatile bool     s_trigger_scan = false;
 //-------------------------------------------------------------------
-/* ------------------------------------------------------------------ */
+/* ================================================================== */
+/* ---- Funciones de protocolo DALY                               ---- */
+/* ================================================================== */
+#ifdef CONFIG_BMS_TYPE_DALY
+//-------------------------------------------------------------------
+/* ---- verificación de checksum DALY ---- */
 static bool verifyChecksum(const uint8_t *pkt, size_t len)
 {
     if (len < 2) return false;
@@ -400,27 +441,220 @@ static void processRxStream(void)
         parseFrame(frame);
     }
 }
+#endif /* CONFIG_BMS_TYPE_DALY */
+/* ================================================================== */
+/* ---- Funciones de protocolo JK BMS (JK02_24S)                 ---- */
+/* ================================================================== */
+#ifdef CONFIG_BMS_TYPE_JK
+//-------------------------------------------------------------------
+static inline uint16_t jk_get_16bit(const uint8_t *d, size_t i)
+{
+    return (uint16_t(d[i + 1]) << 8) | uint16_t(d[i]);
+}
+static inline uint32_t jk_get_32bit(const uint8_t *d, size_t i)
+{
+    return (uint32_t(d[i + 3]) << 24) | (uint32_t(d[i + 2]) << 16) |
+           (uint32_t(d[i + 1]) <<  8) |  uint32_t(d[i]);
+}
+//-------------------------------------------------------------------
+/* ---- parser de la trama JK cell info (300 bytes, type 0x02) ---- */
+static void parseJkCellInfo(const uint8_t *d)
+{
+    /* d[0..3]  = 55 AA EB 90 (cabecera)
+     * d[4]    = tipo (0x02)
+     * d[5]    = contador de trama
+     * d[6-53] = 24 × uint16 LE tensiones de celda (mV)  [JK02_24S]
+     * d[54-57]= bitmask de celdas habilitadas (uint32 LE)
+     * d[118-121] = tensión pack (uint32 LE, ×0.001 V)
+     * d[126-129] = corriente (int32 LE, ×0.001 A; +carga, -descarga)
+     * d[130-131] = temp. sensor 1 (int16 LE, ×0.1 °C)
+     * d[132-133] = temp. sensor 2 (int16 LE, ×0.1 °C)
+     * d[134-135] = temp. MOS     (int16 LE, ×0.1 °C)
+     * d[136-137] = alarmas (big-endian uint16)
+     * d[140]    = balanceo (0=off, 1=carga, 2=descarga)
+     * d[141]    = SOC (uint8, %)
+     * d[142-145]= capacidad restante (uint32 LE, mAh)
+     * d[146-149]= capacidad nominal  (uint32 LE, mAh)
+     * d[150-153]= ciclos (uint32 LE)
+     * d[166]    = MOS carga habilitado
+     * d[167]    = MOS descarga habilitado
+     * d[213]    = cargador conectado
+     * d[299]    = CRC
+     */
+
+    /* Determinar número de celdas a partir del bitmask */
+    uint32_t cellMask = jk_get_32bit(d, 54);
+    int cellCount = __builtin_popcount(cellMask);
+    if (cellCount < 1 || cellCount > 24) cellCount = 16;
+
+    xSemaphoreTake(s_bms_mutex, portMAX_DELAY);
+
+    /* Tensiones de celda */
+    for (int i = 0; i < cellCount; i++) {
+        uint16_t mv = jk_get_16bit(d, 6 + i * 2);
+        s_bms.cell_mv[i] = mv;
+        s_bms.cell_v[i]  = mv * 0.001f;
+    }
+    s_bms.cell_count = (uint8_t)cellCount;
+    s_bms.valid |= (1u << 5);
+
+    /* Tensión y corriente del pack */
+    uint32_t packV_raw   = jk_get_32bit(d, 118);
+    int32_t  current_raw = (int32_t)jk_get_32bit(d, 126);
+    s_bms.voltage = packV_raw * 0.001f;
+    /* Convenio igual que DALY: positivo = descarga, negativo = carga */
+    s_bms.current = -(current_raw * 0.001f);
+    s_bms.soc     = (float)d[141];
+    s_bms.valid  |= (1u << 0);
+
+    /* Capacidad restante (raw en mAh) */
+    s_bms.remaining_mah = jk_get_32bit(d, 142);
+
+    /* Ciclos */
+    s_bms.cycles = (uint16_t)jk_get_32bit(d, 150);
+    s_bms.valid |= (1u << 4);
+
+    /* Temperaturas */
+    float temp1   = (float)((int16_t)jk_get_16bit(d, 130)) * 0.1f;
+    float temp2   = (float)((int16_t)jk_get_16bit(d, 132)) * 0.1f;
+    float tempMos = (float)((int16_t)jk_get_16bit(d, 134)) * 0.1f;
+    s_bms.cell_temps[0] = temp1;
+    s_bms.cell_temps[1] = temp2;
+    s_bms.cell_temps[2] = tempMos;
+    s_bms.temp_count = 3;
+    /* max_temp / min_temp de los dos sensores de batería */
+    if (temp1 >= temp2) { s_bms.max_temp = temp1; s_bms.max_temp_s = 1;
+                          s_bms.min_temp = temp2; s_bms.min_temp_s = 2; }
+    else                { s_bms.max_temp = temp2; s_bms.max_temp_s = 2;
+                          s_bms.min_temp = temp1; s_bms.min_temp_s = 1; }
+    s_bms.valid |= (1u << 2) | (1u << 7);
+
+    /* MOS charge / discharge */
+    s_bms.charge_mos    = (bool)d[166];
+    s_bms.discharge_mos = (bool)d[167];
+
+    /* Modo de carga derivado de la corriente */
+    if      (s_bms.current < -0.1f) s_bms.charge_mode = 1;   /* cargando */
+    else if (s_bms.current >  0.1f) s_bms.charge_mode = 2;   /* descargando */
+    else                            s_bms.charge_mode = 0;    /* estacionario */
+
+    /* Cargador y carga detectados */
+    s_bms.charger = (bool)d[213];
+    s_bms.load    = (s_bms.current > 0.1f);
+    s_bms.valid  |= (1u << 3);
+
+    /* Alarmas (big-endian: d[136]<<8 | d[137]) */
+    s_bms.alarm_flags = (uint32_t)((d[136] << 8) | d[137]);
+    s_bms.valid |= (1u << 8);
+
+    /* Min / max tensión de celda */
+    float minV = 9999.0f, maxV = -1.0f;
+    uint8_t minN = 1, maxN = 1;
+    for (int i = 0; i < cellCount; i++) {
+        float v = s_bms.cell_v[i];
+        if (v > maxV) { maxV = v; maxN = (uint8_t)(i + 1); }
+        if (v > 0.1f && v < minV) { minV = v; minN = (uint8_t)(i + 1); }
+    }
+    s_bms.max_cell_v = maxV;  s_bms.max_cell_n = maxN;
+    s_bms.min_cell_v = minV;  s_bms.min_cell_n = minN;
+    s_bms.diff_mv    = (int)((maxV - minV) * 1000.0f);
+    s_bms.valid |= (1u << 1);
+
+    /* Balance: indicador global (no hay por-celda en JK02_24S) */
+    memset(s_bms.balance, 0, sizeof(s_bms.balance));
+    if (d[140] != 0 && maxN > 0 && maxN <= 48)
+        s_bms.balance[maxN - 1] = true;
+    s_bms.valid |= (1u << 6);
+
+    xSemaphoreGive(s_bms_mutex);
+
+    ESP_LOGD(TAG, "JK cell info: V=%.2f I=%.3f SOC=%.0f%% celdas=%d diff=%dmV",
+             s_bms.voltage, s_bms.current, s_bms.soc, cellCount, s_bms.diff_mv);
+}
+//-------------------------------------------------------------------
+/* ---- ensamblar y procesar notificaciones BLE del JK BMS ---- */
+static void jkAssembleAndProcess(const uint8_t *pData, size_t length)
+{
+    /* Si llega una cabecera nueva, descartar el buffer anterior */
+    if (length >= 4 && pData[0] == 0x55 && pData[1] == 0xAA &&
+        pData[2] == 0xEB && pData[3] == 0x90) {
+        jkStreamLen = 0;
+    }
+    /* Descartar si el buffer se desborda */
+    if (jkStreamLen + length > sizeof(jkStreamBuf)) {
+        ESP_LOGW(TAG, "JK: buffer overflow, descartando");
+        jkStreamLen = 0;
+        return;
+    }
+    memcpy(jkStreamBuf + jkStreamLen, pData, length);
+    jkStreamLen += length;
+
+    if (jkStreamLen < JK_FRAME_SIZE) return;   /* trama incompleta */
+
+    /* Verificar CRC: suma de bytes 0..298 mod 256 */
+    uint8_t crc = 0;
+    for (int i = 0; i < JK_FRAME_SIZE - 1; i++) crc += jkStreamBuf[i];
+    if (crc != jkStreamBuf[JK_FRAME_SIZE - 1]) {
+        ESP_LOGW(TAG, "JK: CRC error (calc=0x%02X recv=0x%02X)", crc,
+                 jkStreamBuf[JK_FRAME_SIZE - 1]);
+        jkStreamLen = 0;
+        return;
+    }
+
+    uint8_t frameType = jkStreamBuf[4];
+    if (frameType == 0x02) parseJkCellInfo(jkStreamBuf);
+
+    /* Eliminar trama procesada del buffer */
+    memmove(jkStreamBuf, jkStreamBuf + JK_FRAME_SIZE,
+            jkStreamLen - JK_FRAME_SIZE);
+    jkStreamLen -= JK_FRAME_SIZE;
+}
+#endif /* CONFIG_BMS_TYPE_JK */
+
 //-------------------------------------------------------------------
 /* ---- callback de notificaciones BLE ---- */
 static void notifyCB(NimBLERemoteCharacteristic *pRemoteCharacteristic,
                      uint8_t *pData, size_t length, bool isNotify)
 {
+#ifdef CONFIG_BMS_TYPE_DALY
     if (rxStreamLen + length > sizeof(rxStreamBuf)) {
         rxStreamLen = 0;
     }
     memcpy(rxStreamBuf + rxStreamLen, pData, length);
     rxStreamLen += length;
     processRxStream();
+#endif
+#ifdef CONFIG_BMS_TYPE_JK
+    jkAssembleAndProcess(pData, length);
+#endif
+    (void)pRemoteCharacteristic; (void)isNotify;
 }
 //-------------------------------------------------------------------
 /* ---- callbacks de escaneo BLE ---- */
 class MyAdvertisedDeviceCallbacks : public NimBLEScanCallbacks {
     void onResult(const NimBLEAdvertisedDevice *dev) override
     {
-        std::string addr = dev->getAddress().toString();
-        std::transform(addr.begin(), addr.end(), addr.begin(),
-                       [](unsigned char c){ return std::tolower(c); });
-        if (addr == BMS_MAC_ADDRESS) {
+        bool matches = false;
+
+        /* Modo auto-detección: MAC configurada a "00:00:00:00:00:00"
+         * → conectar al primer dispositivo que anuncie el UUID del servicio BMS */
+        if (std::string(BMS_MAC_ADDRESS) == "00:00:00:00:00:00") {
+            matches = dev->isAdvertisingService(NimBLEUUID(SERVICE_UUID_MAIN));
+            if (matches) {
+                ESP_LOGI(TAG, "Auto-detectado BMS '%s'  MAC=%s  RSSI=%d",
+                         dev->haveName() ? dev->getName().c_str() : "(sin nombre)",
+                         dev->getAddress().toString().c_str(),
+                         dev->getRSSI());
+            }
+        } else {
+            /* Modo MAC fija: comparar dirección en minúsculas */
+            std::string addr = dev->getAddress().toString();
+            std::transform(addr.begin(), addr.end(), addr.begin(),
+                           [](unsigned char c){ return std::tolower(c); });
+            matches = (addr == BMS_MAC_ADDRESS);
+        }
+
+        if (matches) {
             bmsInfo.address = dev->getAddress();
             bmsInfo.name    = dev->haveName() ? dev->getName() : "";
             bmsInfo.rssi    = dev->getRSSI();
@@ -438,9 +672,11 @@ class ClientCallbacks : public NimBLEClientCallbacks {
     void onConnect(NimBLEClient *pClient) override
     {
         connected = true;
+#ifdef CONFIG_BMS_TYPE_DALY
         resetCellAssembly();
         rxStreamLen       = 0;
         frameBaseDetected = false;
+#endif
         if (s_bms_mutex) {
             xSemaphoreTake(s_bms_mutex, portMAX_DELAY);
             s_bms.ble_connected = true;
@@ -452,8 +688,10 @@ class ClientCallbacks : public NimBLEClientCallbacks {
         connected         = false;
         pRxCharacteristic = nullptr;
         pTxCharacteristic = nullptr;
+#ifdef CONFIG_BMS_TYPE_DALY
         resetCellAssembly();
         rxStreamLen = 0;
+#endif
         if (s_bms_mutex) {
             xSemaphoreTake(s_bms_mutex, portMAX_DELAY);
             s_bms.ble_connected = false;
@@ -491,6 +729,7 @@ static void scanForBMS(int durationSeconds)
     }
 }
 //-------------------------------------------------------------------
+#ifdef CONFIG_BMS_TYPE_DALY
 static void sendDalyRequest(uint8_t cmd, const uint8_t payload8[8] = nullptr)
 {
     if (!pRxCharacteristic || !connected) return;
@@ -513,18 +752,68 @@ static void sendDalyRequest(uint8_t cmd, const uint8_t payload8[8] = nullptr)
         pRxCharacteristic->writeValue(pkt, 13, true);
     }
 }
+#endif /* CONFIG_BMS_TYPE_DALY */
+
+//-------------------------------------------------------------------
+#ifdef CONFIG_BMS_TYPE_JK
+/* ---- enviar comando de lectura al JK BMS (trama de 20 bytes) ---- */
+static void sendJkRequest(uint8_t cmd)
+{
+    if (!pRxCharacteristic || !connected) return;
+    uint8_t frame[20] = {};
+    frame[0] = 0xAA;  frame[1] = 0x55;
+    frame[2] = 0x90;  frame[3] = 0xEB;
+    frame[4] = cmd;   /* 0x96 = cell info, 0x97 = device info */
+    /* bytes 5..18 = 0x00 (sin valor, solo lectura) */
+    uint8_t crc = 0;
+    for (int i = 0; i < 19; i++) crc += frame[i];
+    frame[19] = crc;
+    if (pRxCharacteristic->canWrite()) {
+        pRxCharacteristic->writeValue(frame, 20, false);  /* sin ACK */
+    }
+}
+#endif /* CONFIG_BMS_TYPE_JK */
 //-------------------------------------------------------------------
 static bool discoverAndSubscribe(void)
 {
     if (!pClient || !pClient->isConnected()) return false;
     NimBLERemoteService *svc = pClient->getService(SERVICE_UUID_MAIN);
     if (!svc) return false;
+
+#ifdef CONFIG_BMS_TYPE_DALY
     pTxCharacteristic = svc->getCharacteristic(CHAR_UUID_TX);
     pRxCharacteristic = svc->getCharacteristic(CHAR_UUID_RX);
     if (!pTxCharacteristic || !pRxCharacteristic) return false;
     if (pTxCharacteristic->canNotify()) {
         pTxCharacteristic->subscribe(true, notifyCB);
     }
+#endif
+
+#ifdef CONFIG_BMS_TYPE_JK
+    /* Para JK BMS, TX y RX usan la misma UUID "0000ffe1".
+     * En el dispositivo hay dos características con esa UUID:
+     *   - instancia con Write  (Host→BMS)
+     *   - instancia con Notify (BMS→Host)
+     * Recorremos todas las características del servicio para
+     * identificarlas por sus propiedades. */
+    pRxCharacteristic = nullptr;
+    pTxCharacteristic = nullptr;
+    const auto &chars = svc->getCharacteristics();
+    for (auto *c : chars) {
+        if (c->getUUID() == NimBLEUUID(CHAR_UUID_TX)) {
+            if (c->canNotify() && !pTxCharacteristic) pTxCharacteristic = c;
+            if (c->canWrite()  && !pRxCharacteristic) pRxCharacteristic = c;
+        }
+    }
+    /* Fallback: si solo hay una characteristic, usarla para ambos roles */
+    if (!pTxCharacteristic && pRxCharacteristic) pTxCharacteristic = pRxCharacteristic;
+    if (!pRxCharacteristic && pTxCharacteristic) pRxCharacteristic = pTxCharacteristic;
+    if (!pTxCharacteristic) return false;
+    if (pTxCharacteristic->canNotify()) {
+        pTxCharacteristic->subscribe(true, notifyCB);
+    }
+#endif
+
     return true;
 }
 //-------------------------------------------------------------------
@@ -574,6 +863,12 @@ static char *build_status_json(void)
     xSemaphoreTake(s_bms_mutex, portMAX_DELAY);
     BmsState snap = s_bms;   /* copia local bajo mutex */
     xSemaphoreGive(s_bms_mutex);
+
+#ifdef CONFIG_BMS_TYPE_DALY
+    cJSON_AddStringToObject(root, "bms_model", "DALY Smart BMS");
+#else
+    cJSON_AddStringToObject(root, "bms_model", "JK-PB2A16S-20P");
+#endif
 
     cJSON *ble = cJSON_AddObjectToObject(root, "ble");
     cJSON_AddBoolToObject(ble, "connected", snap.ble_connected);
@@ -1049,10 +1344,16 @@ static esp_err_t ws_handler(httpd_req_t *req)
         } else if (strcmp(cs, "scan") == 0) {
             s_trigger_scan = true;
         } else if (strcmp(cs, "request") == 0) {
+#ifdef CONFIG_BMS_TYPE_DALY
             cJSON *code = cJSON_GetObjectItem(json, "code");
             if (code && cJSON_IsNumber(code))
                 sendDalyRequest((uint8_t)code->valueint);
+#endif
+#ifdef CONFIG_BMS_TYPE_JK
+            sendJkRequest(JK_CMD_CELL_INFO);
+#endif
         } else if (strcmp(cs, "set_charge_mos") == 0) {
+#ifdef CONFIG_BMS_TYPE_DALY
             /* { "cmd": "set_charge_mos", "enable": true|false } */
             cJSON *en = cJSON_GetObjectItem(json, "enable");
             if (en && cJSON_IsBool(en)) {
@@ -1061,7 +1362,9 @@ static esp_err_t ws_handler(httpd_req_t *req)
                 sendDalyRequest(0x44, payload);
                 ESP_LOGI(TAG, "WS → set_charge_mos %s", cJSON_IsTrue(en) ? "ON" : "OFF");
             }
+#endif
         } else if (strcmp(cs, "set_discharge_mos") == 0) {
+#ifdef CONFIG_BMS_TYPE_DALY
             /* { "cmd": "set_discharge_mos", "enable": true|false } */
             cJSON *en = cJSON_GetObjectItem(json, "enable");
             if (en && cJSON_IsBool(en)) {
@@ -1070,10 +1373,13 @@ static esp_err_t ws_handler(httpd_req_t *req)
                 sendDalyRequest(0x45, payload);
                 ESP_LOGI(TAG, "WS → set_discharge_mos %s", cJSON_IsTrue(en) ? "ON" : "OFF");
             }
+#endif
         } else if (strcmp(cs, "reset_soc") == 0) {
+#ifdef CONFIG_BMS_TYPE_DALY
             /* { "cmd": "reset_soc" }  — resetea el SOC al 100% */
             sendDalyRequest(0x00);
             ESP_LOGI(TAG, "WS → reset_soc enviado");
+#endif
         }
     }
     cJSON_Delete(json);
@@ -1504,6 +1810,7 @@ static bool wifi_try_sta(const char *ssid, const char *pass)
 }
 //-------------------------------------------------------------------
 /* ---- tarea principal BLE (equivale a setup() + loop()) ---- */
+#ifdef CONFIG_BMS_TYPE_DALY
 static void daly_ble_task(void *pvParameters)
 {
     /* setup() */
@@ -1564,6 +1871,51 @@ static void daly_ble_task(void *pvParameters)
         vTaskDelay(pdMS_TO_TICKS(20));
     }
 }
+#endif /* CONFIG_BMS_TYPE_DALY */
+
+//-------------------------------------------------------------------
+#ifdef CONFIG_BMS_TYPE_JK
+/* ---- tarea principal BLE para JK BMS ---- */
+static void jk_ble_task(void *pvParameters)
+{
+    NimBLEDevice::init("ESP32-JK-BLE");
+    ESP_LOGI(TAG, "Escaneando JK BMS en %s ...", BMS_MAC_ADDRESS);
+    scanForBMS(8);
+
+    if (bmsInfo.found && connectToBMS()) {
+        connected = true;
+        delay(500);
+        /* Solicitar info de dispositivo y, a continuación, cell info */
+        sendJkRequest(JK_CMD_DEV_INFO);
+        delay(600);
+        sendJkRequest(JK_CMD_CELL_INFO);
+    } else {
+        ESP_LOGW(TAG, "JK BMS no encontrado en el escaneo inicial");
+    }
+
+    static uint64_t lastPoll      = 0;
+    static uint64_t lastReconnect = 0;
+
+    for (;;) {
+        if (connected && pClient && pClient->isConnected()) {
+            if (millis() - lastPoll > 2000) {
+                sendJkRequest(JK_CMD_CELL_INFO);
+                lastPoll = millis();
+            }
+        } else {
+            if (s_trigger_scan || (millis() - lastReconnect > 3000)) {
+                s_trigger_scan = false;
+                cleanupClient();
+                ESP_LOGI(TAG, "Intentando reconexión JK...");
+                scanForBMS(6);
+                if (bmsInfo.found) connectToBMS();
+                lastReconnect = millis();
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+}
+#endif /* CONFIG_BMS_TYPE_JK */
 //-------------------------------------------------------------------
 /* ------------------------------------------------------------------ */
 /* ---- Tarea push remoto a Hostalia                              ---- */
@@ -1679,12 +2031,28 @@ extern "C" void app_main(void)
 
     /* mDNS: accesible como http://bms.local en la red local */
     mdns_init();
+#ifdef CONFIG_BMS_TYPE_DALY
     mdns_hostname_set("bms");
     mdns_instance_name_set("Daly BMS");
+#else
+    mdns_hostname_set("jk-bms");
+    mdns_instance_name_set("JK BMS");
+#endif
     mdns_service_add(nullptr, "_http", "_tcp", 80, nullptr, 0);
-    ESP_LOGI(TAG, "mDNS iniciado: http://bms.local/");
+    ESP_LOGI(TAG, "mDNS iniciado: http://%s.local/",
+#ifdef CONFIG_BMS_TYPE_DALY
+             "bms"
+#else
+             "jk-bms"
+#endif
+    );
 
+#ifdef CONFIG_BMS_TYPE_DALY
     xTaskCreate(daly_ble_task,    "daly_ble",    12288, nullptr, 5, nullptr);
+#endif
+#ifdef CONFIG_BMS_TYPE_JK
+    xTaskCreate(jk_ble_task,      "jk_ble",      12288, nullptr, 5, nullptr);
+#endif
     xTaskCreate(remote_push_task, "remote_push",  8192, nullptr, 3, nullptr);
     xTaskCreate(hist_task,        "hist",          4096, nullptr, 2, nullptr);
     while (1) {

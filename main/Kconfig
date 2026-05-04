@@ -1,0 +1,47 @@
+menu "Configuración BMS"
+
+    choice BMS_TYPE
+        prompt "Tipo de BMS"
+        default BMS_TYPE_DALY
+        help
+            Selecciona el BMS a monitorizar vía Bluetooth.
+
+    config BMS_TYPE_DALY
+        bool "DALY Smart BMS"
+        help
+            BMS DALY (protocolo BLE propietario, trama fija de 13 bytes
+            con cabecera 0xA5, comandos 0x90-0x98).
+
+    config BMS_TYPE_JK
+        bool "JK-PB2A16S-20P (JK BMS serie PB)"
+        help
+            JK BMS serie PB (protocolo BLE nuevo, trama fija de 300 bytes
+            con cabecera 0x55 0xAA 0xEB 0x90, comando CELL_INFO 0x96).
+
+    endchoice
+
+    config BMS_DALY_MAC_ADDRESS
+        string "Dirección MAC BLE del BMS DALY"
+        depends on BMS_TYPE_DALY
+        default "50:18:12:01:1b:68"
+        help
+            Dirección MAC Bluetooth del DALY BMS en minúsculas separada por ':'
+            (p. ej. aa:bb:cc:dd:ee:ff).
+
+    config BMS_JK_MAC_ADDRESS
+        string "Dirección MAC BLE del BMS JK"
+        depends on BMS_TYPE_JK
+        default "00:00:00:00:00:00"
+        help
+            Dirección MAC Bluetooth del JK BMS en minúsculas separada por ':'
+            (p. ej. aa:bb:cc:dd:ee:ff).
+
+            Si se deja el valor "00:00:00:00:00:00" el firmware entra en
+            modo AUTO-DETECCIÓN: escanea los dispositivos BLE cercanos y
+            se conecta automáticamente al primero que anuncie el UUID de
+            servicio correcto (0000FFE0).
+
+            Especificar una MAC concreta es útil cuando hay varios BMS del
+            mismo modelo en el alcance Bluetooth.
+
+endmenu

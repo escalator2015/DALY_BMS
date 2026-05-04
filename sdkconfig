@@ -2411,6 +2411,14 @@ CONFIG_VFS_INITIALIZE_DEV_NULL=y
 # end of Virtual file system
 
 #
+# Configuración BMS
+#
+# CONFIG_BMS_TYPE_DALY is not set
+CONFIG_BMS_TYPE_JK=y
+CONFIG_BMS_JK_MAC_ADDRESS="00:00:00:00:00:00"
+# end of Configuración BMS
+
+#
 # mDNS
 #
 CONFIG_MDNS_MAX_INTERFACES=3

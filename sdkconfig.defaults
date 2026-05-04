@@ -1,5 +1,10 @@
-# Configuración mínima para Daly BMS BLE Client + WiFi STA — ESP32-S3
+# Configuración mínima para BMS BLE Client + WiFi STA — ESP32-S3
 # Aplica cuando se regenera el sdkconfig (idf.py reconfigure)
+
+# ---- BMS seleccionado (DALY por defecto) ----
+CONFIG_BMS_TYPE_DALY=y
+CONFIG_BMS_DALY_MAC_ADDRESS="50:18:12:01:1b:68"
+CONFIG_BMS_JK_MAC_ADDRESS="00:00:00:00:00:00"
 
 # ---- Target ----
 CONFIG_IDF_TARGET="esp32s3"

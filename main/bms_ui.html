@@ -58,6 +58,7 @@ footer{border-top:1px solid #333;padding:8px 0;font-size:11px;color:#888;display
 
 <header>
   <h1>&#9889; BMS Monitor</h1>
+  <div id="bms-model-lbl" style="font-size:11px;color:#888;margin-top:2px"></div>
   <div class="meta">
     <span><span class="dot dr" id="ble-dot"></span><span id="ble-lbl">BLE: desconectado</span></span><br>
     <span id="wifi-ip">WiFi: --</span>
@@ -232,6 +233,9 @@ footer{border-top:1px solid #333;padding:8px 0;font-size:11px;color:#888;display
     g("ble-dot").className = "dot " + (ble.connected ? "dg" : "dr");
     g("ble-lbl").textContent = "BLE: " + (ble.connected ? "conectado" : "desconectado");
 
+    /* BMS model */
+    if(d.bms_model) g("bms-model-lbl").textContent = d.bms_model;
+
     /* WiFi */
     if(d.wifi) g("wifi-ip").textContent = "IP: " + (d.wifi.ip || "--");
 
@@ -369,8 +373,13 @@ footer{border-top:1px solid #333;padding:8px 0;font-size:11px;color:#888;display
   function hideOl(){ g("overlay").classList.remove("show"); }
 
   function wsConn(){
-    showOl("Conectando...");
     var l = location;
+    /* En Live Server / preview local no hay ESP32 — evitar el bucle de reconexión */
+    if(l.hostname === "localhost" || l.hostname === "127.0.0.1"){
+      showOl("Vista previa local \u2014 conecta al ESP32 para datos reales");
+      return;
+    }
+    showOl("Conectando...");
     ws = new WebSocket((l.protocol === "https:" ? "wss://" : "ws://") + l.host + "/ws");
     ws.onopen = function(){
       backoff = 1000; hideOl();
