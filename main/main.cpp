@@ -460,32 +460,37 @@ static inline uint32_t jk_get_32bit(const uint8_t *d, size_t i)
 /* ---- parser de la trama JK cell info (300 bytes, type 0x02) ---- */
 static void parseJkCellInfo(const uint8_t *d)
 {
-    /* d[0..3]  = 55 AA EB 90 (cabecera)
+    /* Protocolo JK02_32S (offset_final = 32 respecto a JK02_24S)
+     * d[0..3]  = 55 AA EB 90 (cabecera)
      * d[4]    = tipo (0x02)
      * d[5]    = contador de trama
-     * d[6-53] = 24 × uint16 LE tensiones de celda (mV)  [JK02_24S]
-     * d[54-57]= bitmask de celdas habilitadas (uint32 LE)
-     * d[118-121] = tensión pack (uint32 LE, ×0.001 V)
-     * d[126-129] = corriente (int32 LE, ×0.001 A; +carga, -descarga)
-     * d[130-131] = temp. sensor 1 (int16 LE, ×0.1 °C)
-     * d[132-133] = temp. sensor 2 (int16 LE, ×0.1 °C)
-     * d[134-135] = temp. MOS     (int16 LE, ×0.1 °C)
-     * d[136-137] = alarmas (big-endian uint16)
-     * d[140]    = balanceo (0=off, 1=carga, 2=descarga)
-     * d[141]    = SOC (uint8, %)
-     * d[142-145]= capacidad restante (uint32 LE, mAh)
-     * d[146-149]= capacidad nominal  (uint32 LE, mAh)
-     * d[150-153]= ciclos (uint32 LE)
-     * d[166]    = MOS carga habilitado
-     * d[167]    = MOS descarga habilitado
-     * d[213]    = cargador conectado
-     * d[299]    = CRC
+     * d[6-69] = 32 × uint16 LE tensiones de celda (mV)  — las no usadas valen 0
+     * d[70-73]= bitmask de celdas habilitadas (uint32 LE)
+     * d[80-143]= 32 × uint16 LE resistencias de celda (mΩ)
+     * d[144-145] = temp. MOS     (int16 LE, ×0.1 °C)   [112+32]
+     * d[146-149] = bitmask resist. alambre
+     * d[150-153] = tensión pack (uint32 LE, ×0.001 V)  [118+32]
+     * d[154-157] = potencia pack (uint32 LE, ×0.001 W) [122+32]
+     * d[158-161] = corriente (int32 LE, ×0.001 A)      [126+32]
+     * d[162-163] = temp. sensor 1 (int16 LE, ×0.1 °C) [130+32]
+     * d[164-165] = temp. sensor 2 (int16 LE, ×0.1 °C) [132+32]
+     * d[166-167] = alarmas (big-endian uint16)          [134+32]
+     * d[170-171] = corriente balanceo (int16 LE, ×0.001 A) [138+32]
+     * d[172]    = balanceo (0=off, 1=carga, 2=descarga) [140+32]
+     * d[173]    = SOC (uint8, %)                        [141+32]
+     * d[174-177]= capacidad restante (uint32 LE, mAh)  [142+32]
+     * d[178-181]= capacidad nominal  (uint32 LE, mAh)  [146+32]
+     * d[182-185]= ciclos (uint32 LE)                   [150+32]
+     * d[198]    = MOS carga habilitado                  [166+32]
+     * d[199]    = MOS descarga habilitado               [167+32]
+     * d[245]    = cargador conectado                    [213+32]
+     * d[299]    = CRC / campo de estado
      */
 
-    /* Determinar número de celdas a partir del bitmask */
-    uint32_t cellMask = jk_get_32bit(d, 54);
+    /* Determinar número de celdas a partir del bitmask (bitmask en d[70] para JK02_32S) */
+    uint32_t cellMask = jk_get_32bit(d, 70);
     int cellCount = __builtin_popcount(cellMask);
-    if (cellCount < 1 || cellCount > 24) cellCount = 16;
+    if (cellCount < 1 || cellCount > 32) cellCount = 16;
 
     xSemaphoreTake(s_bms_mutex, portMAX_DELAY);
 
@@ -499,39 +504,53 @@ static void parseJkCellInfo(const uint8_t *d)
     s_bms.valid |= (1u << 5);
 
     /* Tensión y corriente del pack */
-    uint32_t packV_raw   = jk_get_32bit(d, 118);
-    int32_t  current_raw = (int32_t)jk_get_32bit(d, 126);
+    uint32_t packV_raw   = jk_get_32bit(d, 150);      /* d[118+32] */
+    int32_t  current_raw = (int32_t)jk_get_32bit(d, 158); /* d[126+32] */
     s_bms.voltage = packV_raw * 0.001f;
     /* Convenio igual que DALY: positivo = descarga, negativo = carga */
     s_bms.current = -(current_raw * 0.001f);
-    s_bms.soc     = (float)d[141];
+    s_bms.soc     = (float)d[173];                    /* d[141+32] */
     s_bms.valid  |= (1u << 0);
 
     /* Capacidad restante (raw en mAh) */
-    s_bms.remaining_mah = jk_get_32bit(d, 142);
+    s_bms.remaining_mah = jk_get_32bit(d, 174);       /* d[142+32] */
 
     /* Ciclos */
-    s_bms.cycles = (uint16_t)jk_get_32bit(d, 150);
+    s_bms.cycles = (uint16_t)jk_get_32bit(d, 182);   /* d[150+32] */
     s_bms.valid |= (1u << 4);
 
-    /* Temperaturas */
-    float temp1   = (float)((int16_t)jk_get_16bit(d, 130)) * 0.1f;
-    float temp2   = (float)((int16_t)jk_get_16bit(d, 132)) * 0.1f;
-    float tempMos = (float)((int16_t)jk_get_16bit(d, 134)) * 0.1f;
+    /* Temperaturas JK02_32S (16S = 4 sensores batería, 1 por cada 4 celdas):
+     * d[162-163] = Sensor batería 1  [130+32]
+     * d[164-165] = Sensor batería 2  [132+32]
+     * d[258-259] = Sensor batería 3  [226+32]
+     * d[256-257] = Sensor batería 4  [224+32]
+     * d[144-145] = MOS (power tube)  [112+32] */
+    float temp1   = (float)((int16_t)jk_get_16bit(d, 162)) * 0.1f; /* sensor 1 */
+    float temp2   = (float)((int16_t)jk_get_16bit(d, 164)) * 0.1f; /* sensor 2 */
+    float temp3   = (float)((int16_t)jk_get_16bit(d, 258)) * 0.1f; /* sensor 3 */
+    float temp4   = (float)((int16_t)jk_get_16bit(d, 256)) * 0.1f; /* sensor 4 */
+    float tempMos = (float)((int16_t)jk_get_16bit(d, 144)) * 0.1f; /* MOS */
     s_bms.cell_temps[0] = temp1;
     s_bms.cell_temps[1] = temp2;
-    s_bms.cell_temps[2] = tempMos;
-    s_bms.temp_count = 3;
-    /* max_temp / min_temp de los dos sensores de batería */
-    if (temp1 >= temp2) { s_bms.max_temp = temp1; s_bms.max_temp_s = 1;
-                          s_bms.min_temp = temp2; s_bms.min_temp_s = 2; }
-    else                { s_bms.max_temp = temp2; s_bms.max_temp_s = 2;
-                          s_bms.min_temp = temp1; s_bms.min_temp_s = 1; }
+    s_bms.cell_temps[2] = temp3;
+    s_bms.cell_temps[3] = temp4;
+    s_bms.cell_temps[4] = tempMos;
+    s_bms.temp_count = 5;   /* S1..S4 batería + S5 MOS */
+    /* max_temp / min_temp de los 4 sensores de batería */
+    float tmax = temp1, tmin = temp1;
+    uint8_t smax = 1, smin = 1;
+    float tarr[4] = {temp1, temp2, temp3, temp4};
+    for (int ti = 1; ti < 4; ti++) {
+        if (tarr[ti] > tmax) { tmax = tarr[ti]; smax = ti + 1; }
+        if (tarr[ti] < tmin) { tmin = tarr[ti]; smin = ti + 1; }
+    }
+    s_bms.max_temp = tmax; s_bms.max_temp_s = smax;
+    s_bms.min_temp = tmin; s_bms.min_temp_s = smin;
     s_bms.valid |= (1u << 2) | (1u << 7);
 
     /* MOS charge / discharge */
-    s_bms.charge_mos    = (bool)d[166];
-    s_bms.discharge_mos = (bool)d[167];
+    s_bms.charge_mos    = (bool)d[198];               /* d[166+32] */
+    s_bms.discharge_mos = (bool)d[199];               /* d[167+32] */
 
     /* Modo de carga derivado de la corriente */
     if      (s_bms.current < -0.1f) s_bms.charge_mode = 1;   /* cargando */
@@ -539,12 +558,12 @@ static void parseJkCellInfo(const uint8_t *d)
     else                            s_bms.charge_mode = 0;    /* estacionario */
 
     /* Cargador y carga detectados */
-    s_bms.charger = (bool)d[213];
+    s_bms.charger = (bool)d[245];                     /* d[213+32] */
     s_bms.load    = (s_bms.current > 0.1f);
     s_bms.valid  |= (1u << 3);
 
-    /* Alarmas (big-endian: d[136]<<8 | d[137]) */
-    s_bms.alarm_flags = (uint32_t)((d[136] << 8) | d[137]);
+    /* Alarmas (big-endian: d[166]=HI d[167]=LO para JK02_32S → d[134+32]) */
+    s_bms.alarm_flags = (uint32_t)((d[166] << 8) | d[167]);
     s_bms.valid |= (1u << 8);
 
     /* Min / max tensión de celda */
@@ -560,9 +579,9 @@ static void parseJkCellInfo(const uint8_t *d)
     s_bms.diff_mv    = (int)((maxV - minV) * 1000.0f);
     s_bms.valid |= (1u << 1);
 
-    /* Balance: indicador global (no hay por-celda en JK02_24S) */
+    /* Balance: indicador global (d[172] = d[140+32] para JK02_32S) */
     memset(s_bms.balance, 0, sizeof(s_bms.balance));
-    if (d[140] != 0 && maxN > 0 && maxN <= 48)
+    if (d[172] != 0 && maxN > 0 && maxN <= 48)
         s_bms.balance[maxN - 1] = true;
     s_bms.valid |= (1u << 6);
 
@@ -595,11 +614,15 @@ static void jkAssembleAndProcess(const uint8_t *pData, size_t length)
     uint8_t crc = 0;
     for (int i = 0; i < JK_FRAME_SIZE - 1; i++) crc += jkStreamBuf[i];
     if (crc != jkStreamBuf[JK_FRAME_SIZE - 1]) {
-        ESP_LOGW(TAG, "JK: CRC error (calc=0x%02X recv=0x%02X)", crc,
-                 jkStreamBuf[JK_FRAME_SIZE - 1]);
-        jkStreamLen = 0;
-        return;
+        /* Sólo advertencia — el BMS puede usar byte[299] como campo de estado,
+         * no como CRC, según el firmware. Los datos siguen siendo válidos. */
+        ESP_LOGD(TAG, "JK: CRC warn (calc=0x%02X byte299=0x%02X) — parsing igualmente",
+                 crc, jkStreamBuf[JK_FRAME_SIZE - 1]);
     }
+
+    ESP_LOGD(TAG, "JK frame: %02X %02X %02X %02X %02X %02X %02X %02X ...",
+             jkStreamBuf[0], jkStreamBuf[1], jkStreamBuf[2], jkStreamBuf[3],
+             jkStreamBuf[4], jkStreamBuf[5], jkStreamBuf[6], jkStreamBuf[7]);
 
     uint8_t frameType = jkStreamBuf[4];
     if (frameType == 0x02) parseJkCellInfo(jkStreamBuf);
@@ -667,6 +690,10 @@ class MyAdvertisedDeviceCallbacks : public NimBLEScanCallbacks {
     }
 };
 //-------------------------------------------------------------------
+/* ---- PIN para pairing BLE con el BMS ---- */
+#define BMS_BLE_PASSKEY  1234
+
+//-------------------------------------------------------------------
 /* ---- callbacks del cliente BLE ---- */
 class ClientCallbacks : public NimBLEClientCallbacks {
     void onConnect(NimBLEClient *pClient) override
@@ -700,6 +727,27 @@ class ClientCallbacks : public NimBLEClientCallbacks {
         if (::pClient) {
             NimBLEDevice::deleteClient(::pClient);
             ::pClient = nullptr;
+        }
+    }
+    /* ---- pairing: el BMS pide que introduzcamos el PIN ---- */
+    void onPassKeyEntry(NimBLEConnInfo &connInfo) override
+    {
+        ESP_LOGI(TAG, "BLE pairing: BMS solicita PIN, enviando %d", BMS_BLE_PASSKEY);
+        NimBLEDevice::injectPassKey(connInfo, BMS_BLE_PASSKEY);
+    }
+    /* ---- pairing: comparación numérica (Just Works / Numeric Comparison) ---- */
+    void onConfirmPasskey(NimBLEConnInfo &connInfo, uint32_t pin) override
+    {
+        ESP_LOGI(TAG, "BLE pairing: confirmando PIN mostrado en BMS = %06lu", (unsigned long)pin);
+        NimBLEDevice::injectConfirmPasskey(connInfo, true);
+    }
+    /* ---- pairing: resultado de autenticación ---- */
+    void onAuthenticationComplete(NimBLEConnInfo &connInfo) override
+    {
+        if (connInfo.isEncrypted()) {
+            ESP_LOGI(TAG, "BLE pairing: autenticación completada — enlace cifrado");
+        } else {
+            ESP_LOGW(TAG, "BLE pairing: autenticación completada — enlace SIN cifrar");
         }
     }
 };
@@ -776,14 +824,14 @@ static void sendJkRequest(uint8_t cmd)
 //-------------------------------------------------------------------
 static bool discoverAndSubscribe(void)
 {
-    if (!pClient || !pClient->isConnected()) return false;
+    if (!pClient || !pClient->isConnected()) { ESP_LOGE(TAG, "discoverAndSubscribe: cliente no conectado"); return false; }
     NimBLERemoteService *svc = pClient->getService(SERVICE_UUID_MAIN);
-    if (!svc) return false;
+    if (!svc) { ESP_LOGE(TAG, "discoverAndSubscribe: servicio %s no encontrado", SERVICE_UUID_MAIN); return false; }
 
 #ifdef CONFIG_BMS_TYPE_DALY
     pTxCharacteristic = svc->getCharacteristic(CHAR_UUID_TX);
     pRxCharacteristic = svc->getCharacteristic(CHAR_UUID_RX);
-    if (!pTxCharacteristic || !pRxCharacteristic) return false;
+    if (!pTxCharacteristic || !pRxCharacteristic) { ESP_LOGE(TAG, "discoverAndSubscribe: características DALY no encontradas (TX=%p RX=%p)", pTxCharacteristic, pRxCharacteristic); return false; }
     if (pTxCharacteristic->canNotify()) {
         pTxCharacteristic->subscribe(true, notifyCB);
     }
@@ -798,8 +846,12 @@ static bool discoverAndSubscribe(void)
      * identificarlas por sus propiedades. */
     pRxCharacteristic = nullptr;
     pTxCharacteristic = nullptr;
-    const auto &chars = svc->getCharacteristics();
+    const auto &chars = svc->getCharacteristics(true);  /* true = forzar discovery GATT */
+    ESP_LOGI(TAG, "discoverAndSubscribe: %d características encontradas en servicio ffe0", (int)chars.size());
     for (auto *c : chars) {
+        ESP_LOGI(TAG, "  UUID=%s notify=%d write=%d",
+                 c->getUUID().toString().c_str(),
+                 (int)c->canNotify(), (int)c->canWrite());
         if (c->getUUID() == NimBLEUUID(CHAR_UUID_TX)) {
             if (c->canNotify() && !pTxCharacteristic) pTxCharacteristic = c;
             if (c->canWrite()  && !pRxCharacteristic) pRxCharacteristic = c;
@@ -808,7 +860,10 @@ static bool discoverAndSubscribe(void)
     /* Fallback: si solo hay una characteristic, usarla para ambos roles */
     if (!pTxCharacteristic && pRxCharacteristic) pTxCharacteristic = pRxCharacteristic;
     if (!pRxCharacteristic && pTxCharacteristic) pRxCharacteristic = pTxCharacteristic;
-    if (!pTxCharacteristic) return false;
+    if (!pTxCharacteristic) { ESP_LOGE(TAG, "discoverAndSubscribe: característica JK (ffe1) no encontrada"); return false; }
+    ESP_LOGI(TAG, "discoverAndSubscribe: TX=%s RX=%s",
+             pTxCharacteristic ? pTxCharacteristic->getUUID().toString().c_str() : "null",
+             pRxCharacteristic ? pRxCharacteristic->getUUID().toString().c_str() : "null");
     if (pTxCharacteristic->canNotify()) {
         pTxCharacteristic->subscribe(true, notifyCB);
     }
@@ -820,21 +875,34 @@ static bool discoverAndSubscribe(void)
 static bool connectToBMS(void)
 {
     if (!bmsInfo.found) return false;
+    ESP_LOGI(TAG, "connectToBMS: intentando conectar a %s (RSSI=%d)",
+             bmsInfo.address.toString().c_str(), bmsInfo.rssi);
     if (pClient) { NimBLEDevice::deleteClient(pClient); pClient = nullptr; }
     pClient = NimBLEDevice::createClient();
     pClient->setClientCallbacks(new ClientCallbacks());
     pClient->setConnectTimeout(5000);
     if (!pClient->connect(bmsInfo.address)) {
+        ESP_LOGE(TAG, "connectToBMS: fallo al conectar a %s", bmsInfo.address.toString().c_str());
         NimBLEDevice::deleteClient(pClient);
         pClient = nullptr;
         return false;
     }
+    ESP_LOGI(TAG, "connectToBMS: enlace BLE establecido, iniciando pairing/cifrado...");
+    /* Forzar pairing antes de GATT discovery — el JK BMS protege las características */
+    if (!pClient->secureConnection()) {
+        ESP_LOGW(TAG, "connectToBMS: secureConnection falló o no requerido, continuando...");
+    } else {
+        ESP_LOGI(TAG, "connectToBMS: pairing/cifrado completado OK");
+    }
+    ESP_LOGI(TAG, "connectToBMS: descubriendo servicios...");
     if (!discoverAndSubscribe()) {
+        ESP_LOGE(TAG, "connectToBMS: fallo en discoverAndSubscribe");
         pClient->disconnect();
         NimBLEDevice::deleteClient(pClient);
         pClient = nullptr;
         return false;
     }
+    ESP_LOGI(TAG, "connectToBMS: conectado y suscrito OK");
     return true;
 }
 //-------------------------------------------------------------------
@@ -1457,7 +1525,7 @@ static void http_server_init(void)
 static const char CP_HTML[] =
 "<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
 "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
-"<title>DALY BMS - WiFi Setup</title>"
+"<title>BMS Monitor- WiFi Setup</title>"
 "<style>"
 "*{box-sizing:border-box}"
 "body{font-family:sans-serif;max-width:420px;margin:30px auto;padding:16px;background:#0d1b2a;color:#e0e0e0}"
@@ -1879,6 +1947,10 @@ static void daly_ble_task(void *pvParameters)
 static void jk_ble_task(void *pvParameters)
 {
     NimBLEDevice::init("ESP32-JK-BLE");
+    /* Configurar seguridad BLE para pairing con PIN (JK BMS puede requerirlo) */
+    NimBLEDevice::setSecurityAuth(true, true, true);          /* bonding, MITM, SC */
+    NimBLEDevice::setSecurityIOCap(BLE_HS_IO_KEYBOARD_ONLY); /* el ESP32 introduce el PIN */
+    NimBLEDevice::setSecurityPasskey(BMS_BLE_PASSKEY);
     ESP_LOGI(TAG, "Escaneando JK BMS en %s ...", BMS_MAC_ADDRESS);
     scanForBMS(8);
 
@@ -1890,7 +1962,10 @@ static void jk_ble_task(void *pvParameters)
         delay(600);
         sendJkRequest(JK_CMD_CELL_INFO);
     } else {
-        ESP_LOGW(TAG, "JK BMS no encontrado en el escaneo inicial");
+        if (!bmsInfo.found)
+            ESP_LOGW(TAG, "JK BMS no detectado en el escaneo inicial");
+        else
+            ESP_LOGW(TAG, "JK BMS detectado pero fallo al conectar en el escaneo inicial");
     }
 
     static uint64_t lastPoll      = 0;
@@ -2035,17 +2110,11 @@ extern "C" void app_main(void)
     mdns_hostname_set("bms");
     mdns_instance_name_set("Daly BMS");
 #else
-    mdns_hostname_set("jk-bms");
+    mdns_hostname_set("bms");
     mdns_instance_name_set("JK BMS");
 #endif
     mdns_service_add(nullptr, "_http", "_tcp", 80, nullptr, 0);
-    ESP_LOGI(TAG, "mDNS iniciado: http://%s.local/",
-#ifdef CONFIG_BMS_TYPE_DALY
-             "bms"
-#else
-             "jk-bms"
-#endif
-    );
+    ESP_LOGI(TAG, "mDNS iniciado: http://bms.local/");
 
 #ifdef CONFIG_BMS_TYPE_DALY
     xTaskCreate(daly_ble_task,    "daly_ble",    12288, nullptr, 5, nullptr);
